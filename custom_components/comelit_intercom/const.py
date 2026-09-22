@@ -21,6 +21,17 @@ DEFAULT_WEB_PASSWORD = "comelit"
 # Name of the dedicated user the integration auto-creates for its own identity.
 HA_USER_NAME = "Home Assistant"
 
+# The device web UI answers in whatever language it is configured for, so these
+# success phrases only cover the locales we have samples for (issue #64). They
+# are a fast path for a precise error message, never a hard gate: an
+# unrecognised body falls through and the flow is judged on whether the backup
+# actually downloads and parses, which is locale-independent.
+WEB_LOGIN_OK_MARKERS = (
+    "Access granted",  # en_US
+    "Accesso consentito",  # it_IT ("Accesso consentito come Installatore")
+)
+WEB_BACKUP_OK_MARKERS = ("Backup successfully created",)  # en_US
+
 # Update interval (in seconds)
 UPDATE_INTERVAL = 300  # 5 minutes
 

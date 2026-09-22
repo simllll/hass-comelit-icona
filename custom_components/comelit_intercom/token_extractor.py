@@ -16,6 +16,8 @@ from pathlib import Path
 
 import aiohttp
 
+from .const import WEB_BACKUP_OK_MARKERS, WEB_LOGIN_OK_MARKERS
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -58,11 +60,18 @@ async def extract_token(
 
                 login_content = await resp.text()
 
-                if "Access granted" not in login_content:
-                    _LOGGER.error("Login failed - check password")
-                    return None
-
-                _LOGGER.info("Login successful")
+                if any(m in login_content for m in WEB_LOGIN_OK_MARKERS):
+                    _LOGGER.info("Login successful")
+                else:
+                    # The confirmation phrase is localised (issue #64: an
+                    # Italian UI answers "Accesso consentito come
+                    # Installatore"), so an unknown body is not proof of
+                    # failure. Carry on - a wrong password surfaces below as a
+                    # backup that never appears.
+                    _LOGGER.debug(
+                        "Login response not recognised (device language?); "
+                        "continuing and verifying via the backup step"
+                    )
 
             # Step 2: Create a new backup
             # We need to create a fresh backup to ensure we get the current token
@@ -77,11 +86,15 @@ async def extract_token(
                 f"{base_url}/create-backup.html", headers=headers
             ) as resp:
                 create_response = await resp.text()
-                if "Backup successfully created" not in create_response:
-                    _LOGGER.error(f"Backup creation failed: {create_response}")
-                    return None
-
-                _LOGGER.info("Backup created successfully")
+                if any(m in create_response for m in WEB_BACKUP_OK_MARKERS):
+                    _LOGGER.info("Backup created successfully")
+                else:
+                    # Localised confirmation again - judge this on the
+                    # download below.
+                    _LOGGER.debug(
+                        "Backup confirmation not recognised (device "
+                        "language?); continuing to the backup listing"
+                    )
 
             # Step 3: Wait for backup creation to complete
             # The device needs a moment to actually create the backup file
@@ -99,7 +112,10 @@ async def extract_token(
             # We want the highest number (most recent timestamp)
             backup_files = re.findall(r"([0-9]+\.tar\.gz)", backup_page)
             if not backup_files:
-                _LOGGER.error("No backup files found")
+                _LOGGER.error(
+                    "No backup files found - the web password is probably "
+                    "wrong, or the backup could not be created"
+                )
                 return None
 
             # Sort numerically to get the most recent backup
