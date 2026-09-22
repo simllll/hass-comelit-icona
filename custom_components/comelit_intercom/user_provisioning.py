@@ -34,7 +34,13 @@ import tarfile
 
 import aiohttp
 
-from .const import DEFAULT_WEB_PASSWORD, DEFAULT_WEB_PORT, HA_USER_NAME
+from .const import (
+    DEFAULT_WEB_PASSWORD,
+    DEFAULT_WEB_PORT,
+    HA_USER_NAME,
+    WEB_BACKUP_OK_MARKERS,
+    WEB_LOGIN_OK_MARKERS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -128,9 +134,21 @@ async def _login(
         _LOGGER.error("Web UI login request failed: %s", err)
         return False
 
-    if resp.status != 200 or "Access granted" not in body:
-        _LOGGER.error("Web UI login failed - check the device password")
+    if resp.status != 200:
+        _LOGGER.error(
+            "Web UI login failed with status %s - check the device password",
+            resp.status,
+        )
         return False
+    if not any(marker in body for marker in WEB_LOGIN_OK_MARKERS):
+        # The confirmation phrase is localised, so an unknown body is not proof
+        # of failure (issue #64: an Italian UI answers "Accesso consentito
+        # come Installatore"). Carry on - a wrong password surfaces as a failed
+        # backup download a moment later.
+        _LOGGER.debug(
+            "Web UI login response not recognised (device language?); "
+            "continuing and verifying via the backup step"
+        )
     return True
 
 
@@ -150,16 +168,23 @@ async def _fetch_user_map(
         async with session.post(
             f"{base_url}/create-backup.html", headers=headers
         ) as resp:
-            if "Backup successfully created" not in await resp.text():
-                _LOGGER.error("Backup creation failed")
-                return None
+            created = await resp.text()
+        if not any(marker in created for marker in WEB_BACKUP_OK_MARKERS):
+            # Localised confirmation again - judge this on the download below.
+            _LOGGER.debug(
+                "Backup confirmation not recognised (device language?); "
+                "continuing to the backup listing"
+            )
         await asyncio.sleep(2)  # give the device a moment to write the file
 
         async with session.get(f"{base_url}/config-backup.html") as resp:
             page = await resp.text()
         backups = sorted(re.findall(r"([0-9]+\.tar\.gz)", page))
         if not backups:
-            _LOGGER.error("No backup file found on the device")
+            _LOGGER.error(
+                "No backup file found on the device - the web password is "
+                "probably wrong, or the backup could not be created"
+            )
             return None
 
         async with session.get(f"{base_url}/{backups[-1]}") as resp:
