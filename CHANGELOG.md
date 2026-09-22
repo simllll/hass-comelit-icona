@@ -4,6 +4,14 @@ This file is maintained automatically by
 [release-please](https://github.com/googleapis/release-please) from
 [Conventional Commit](https://www.conventionalcommits.org/) messages.
 
+## [1.13.3](https://github.com/simllll/hass-comelit-icona/compare/v1.13.2...v1.13.3) (2026-09-22)
+
+
+### Bug Fixes
+
+* don't gate web-UI setup on English-only confirmation strings ([#70](https://github.com/simllll/hass-comelit-icona/issues/70)) ([b635c76](https://github.com/simllll/hass-comelit-icona/commit/b635c7615d243ff099d136143858cdec35c689f7)), closes [#69](https://github.com/simllll/hass-comelit-icona/issues/69)
+* open peer/TAP doors over the shared CTPP ([#67](https://github.com/simllll/hass-comelit-icona/issues/67)) ([a6ca3cb](https://github.com/simllll/hass-comelit-icona/commit/a6ca3cbf89bd68cc9ecb8a9179e3c6b194ef4ed5)), closes [#64](https://github.com/simllll/hass-comelit-icona/issues/64)
+
 ## [1.13.2](https://github.com/simllll/hass-comelit-icona/compare/v1.13.1...v1.13.2) (2026-08-29)
 
 
