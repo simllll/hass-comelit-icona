@@ -35,6 +35,7 @@ Open a channel with a COMMAND packet, use it, close with END.
 | `CTPP` | 16 | call/door control **and local call signalling** |
 | `CSPB` | 17 | secondary control (opened alongside CTPP) |
 | `PUSH` | 2  | push-token enrollment |
+| `FRCG` | 7  | face recognition: parameters + monitor notifications (see §10) |
 | `UADM` | ?  | admin (create user / generate code) — needs admin auth |
 | `RTPC` | — | device-initiated: RTP control for video |
 | `UDPM` | — | device-initiated: UDP media negotiation for video |
@@ -156,6 +157,51 @@ NALs. Sequence: `call_init 0x18C0/0x0028` → `codec 0x1840/0x0008` →
 + `UDPM` channels and streams UDP media (`intercom:64100 → client:<udp port>`).
 Depacketise (reorder by RTP seq, reassemble FU-A) → Annex-B H.264 → 320×240.
 No RTSP URL is exposed unless `rtsp-camera-address-book` is populated.
+
+## 10. Face recognition (FRCG)
+
+Monitors with face recognition list `face-recognition-channel` in
+`server-info.capabilities` (e.g. 6741W `MSVF`). The official app opens `FRCG`
+(wire type 7) on every session, after CTPP/CSPB, and asks the parameters:
+```json
+{"message":"rcg-get-params","message-type":"request","message-id":121}
+```
+The monitor replies, then sends a `rcg-params-result` notification with
+`parameters.enable` (bool) and `parameters.threshold` (int) (seen on a 6741W,
+firmware 2.1.0). When a face is detected at a call it pushes, on the same
+channel (PCAP of the Android app on a 6701W, firmware 2.1.0):
+```json
+{"message":"rcg-detected-recognition","message-type":"notification","message-id":1,
+ "data":{"session-id":"...","external-id":"unknown","recognized":false,"activated":false,
+         "similarity":"3.079382","confidence":"...",
+         "image-url":"https://eps.cloud.comelitgroup.com/servicerest/facerecognition/getfaceimagebykey/v1/<key>.jpeg",
+         "box":{"width":"...","height":"...","top":"...","left":"..."}}}
+{"message":"rcg-detected-image","message-type":"notification","message-id":2,
+ "image":{"path":"/etc/comelit/recognition/detected/unknown/<timestamp>.jpg",
+          "external-id":"unknown","changed":true}}
+```
+Numbers arrive as strings. The match is made with Comelit's cloud (the image
+URL points there), so it needs internet on the monitor. The integration relays
+these as `comelit_intercom_face` events when the "Face recognition events"
+option is on; the image URL is not forwarded. Sources: mnestrud/antoiba86 6701W
+protocol reference (PCAP), davidebr90/pycomeca (6741W), grdw/viper-client.
+
+**Verified on a 6741W (`MSVF`, firmware 2.1.0)** through the integration's
+shared connection (HA identity, no app session open):
+- `rcg-get-params` gets a `response-code: 200` reply, then
+  `rcg-params-result` with `{"enable": true, "threshold": 95}`;
+- an enrolled person ringing produced, about 6 s after the ring:
+  ```json
+  {"message":"rcg-detected-recognition","message-type":"notification","message-id":1,
+   "notification-code":200,"notification-string":"Recognition Detected",
+   "data":{"session-id":"114671927","external-id":"michele","recognized":true,
+           "activated":true,"similarity":"99.8128","confidence":"99.9732",
+           "image-url":"<omitted>", ...}}
+  ```
+  `external-id` is the name given to the face on the monitor/app (lowercase
+  here). `activated: true` matched the monitor's own lock release: several
+  `0x1860/0x0003` (door open) VIP messages followed on CTPP. No
+  `rcg-detected-image` was received in that test.
 
 ## Firmware differences (why no heavy abstraction layer)
 

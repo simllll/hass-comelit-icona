@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import math
 import time
 from datetime import timedelta
 from typing import Any
@@ -29,21 +31,37 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .comelit_client import IconaBridgeClient
 from .const import (
     CONF_AUTO_ANSWER,
+    CONF_FACE_RECOGNITION,
     CONF_HOST,
     CONF_PORT,
     CONF_TOKEN,
     DEFAULT_PORT,
     DOMAIN,
+    EVENT_FACE,
     UPDATE_INTERVAL,
 )
 from .events import address_matches
 from .fcm_push import signal_snapshot
-from .icona.channels import ChannelType
+from .icona.channels import Channel, ChannelType
 from .icona.client import IconaBridgeClient as SharedIconaClient
 from .icona.ctpp import _VIP_ACK_TS_INCR, ctpp_init_sequence
+from .icona.protocol import decode_json_body, is_json_body
 from .video_stream import ComelitStreamManager
 
 _LOGGER = logging.getLogger(__name__)
+
+# Face-recognition channel (FRCG). The official app opens it on every session
+# (after CTPP/CSPB); the monitor then pushes rcg-* JSON notifications on it when
+# a face is detected/recognised at a call. Wire type 7, like UAUT.
+_FRCG_CHANNEL = "FRCG"
+# server-info capability that advertises the channel (e.g. 6741W "MSVF").
+_FRCG_CAPABILITY = "face-recognition-channel"
+# How often the FRCG reader wakes up to notice a dead/replaced connection.
+_FRCG_POLL = 60.0
+# Max wait for the FRCG channel open (held under the CTPP lock) and for the
+# rcg-get-params reply.
+_FRCG_OPEN_TIMEOUT = 5.0
+_FRCG_REPLY_TIMEOUT = 5.0
 
 # CTPP re-registration cadence. The panel silently expires our ring
 # registration if we don't periodically re-assert it — after which the socket
@@ -55,6 +73,34 @@ _KEEPALIVE_INTERVAL = 120
 # (network blip, reboot); we keep retrying (5s → … → 60s cap) until it's back.
 _RECONNECT_BACKOFF_START = 5
 _RECONNECT_BACKOFF_MAX = 60
+
+
+def _as_float(value: Any) -> float | None:
+    """FRCG numbers arrive as strings ("3.079382"): finite float, or None."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _as_bool(value: Any) -> bool:
+    """FRCG flags: JSON booleans, tolerating "true"/"false"/"1"/"0" strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1")
+    if isinstance(value, int | float):
+        return value == 1
+    return False
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """FRCG sub-objects: a dict, a JSON-encoded dict, or nothing."""
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            value = json.loads(value)
+    return value if isinstance(value, dict) else {}
 
 
 class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -92,6 +138,14 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._keepalive_task: asyncio.Task[None] | None = None
         # Set on entry unload so the (now indefinite) reconnect loop stops.
         self._shutdown = False
+        # Face recognition (FRCG, opt-in): reader task on the shared connection,
+        # the last parameters reported by the monitor (enable, threshold) and a
+        # flag set when the monitor did not answer the channel open. Not retried
+        # on every reconnect: a late answer would be matched to the next channel
+        # open (see _frcg_run).
+        self._frcg_task: asyncio.Task[None] | None = None
+        self._frcg_unsupported = False
+        self.face_params: dict[str, Any] = {}
 
         # Live-video/snapshot manager reuses the shared connection's CTPP.
         self.stream = ComelitStreamManager(
@@ -334,6 +388,10 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Keep the connection alive so it doesn't churn every idle cycle.
         self._start_keepalive()
 
+        # Face-recognition notifications (optional, never fatal): its own
+        # background task, so a monitor without FRCG can't delay or break rings.
+        self._start_frcg(client)
+
     async def _authenticate(self, client: SharedIconaClient) -> None:
         """Authenticate the shared client via an inline UAUT access request."""
         ua = await client.open_channel("UAUT", ChannelType.UAUT)
@@ -385,6 +443,160 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._keepalive_task is not None and not self._keepalive_task.done():
             self._keepalive_task.cancel()
         self._keepalive_task = None
+
+    # --- face recognition (FRCG) ------------------------------------------
+
+    def _start_frcg(self, client: SharedIconaClient) -> None:
+        """(Re)start the face-recognition reader on the shared connection.
+
+        Opt-in, and skipped when server-info is known and does not advertise
+        the channel, or after the monitor once failed to answer the open. Must
+        never raise: it runs at the end of _connect_shared.
+        """
+        self._cancel_frcg()
+        if self._frcg_unsupported or not self.entry.options.get(
+            CONF_FACE_RECOGNITION, False
+        ):
+            return
+        caps = self.server_info.get("capabilities")
+        if isinstance(caps, list) and _FRCG_CAPABILITY not in caps:
+            _LOGGER.debug("No %s in server-info: FRCG not opened", _FRCG_CAPABILITY)
+            return
+        self._frcg_task = self.entry.async_create_background_task(
+            self.hass, self._frcg_run(client), "comelit-frcg"
+        )
+
+    def _cancel_frcg(self) -> None:
+        if self._frcg_task is not None and not self._frcg_task.done():
+            self._frcg_task.cancel()
+        self._frcg_task = None
+
+    async def _frcg_run(self, client: SharedIconaClient) -> None:
+        """Open FRCG, ask the monitor's parameters, then relay its notifications.
+
+        The channel lives on the shared connection (no second ICONA session and
+        no CTPP involvement): the client's receive loop already queues JSON for
+        an open channel, so this task only drains that queue.
+        """
+        # The client matches an open reply to the first pending open, so this
+        # one must not overlap a video start's opens: take the CTPP lock,
+        # briefly. On failure drop the half-open entry so it can't capture a
+        # later open's reply. After a timeout don't retry on every reconnect: a
+        # reply arriving later still lands on whatever open is pending then.
+        try:
+            async with self._ctpp_lock:
+                channel = await asyncio.wait_for(
+                    client.open_channel(
+                        _FRCG_CHANNEL, ChannelType.UAUT, wire_name=_FRCG_CHANNEL
+                    ),
+                    timeout=_FRCG_OPEN_TIMEOUT,
+                )
+        except asyncio.CancelledError:
+            client.remove_channel(_FRCG_CHANNEL)
+            raise
+        except TimeoutError:
+            client.remove_channel(_FRCG_CHANNEL)
+            self._frcg_unsupported = True
+            _LOGGER.warning(
+                "Face recognition channel (FRCG) did not open within %.0fs; "
+                "not retried until the integration is reloaded",
+                _FRCG_OPEN_TIMEOUT,
+            )
+            return
+        except Exception as err:  # noqa: BLE001
+            client.remove_channel(_FRCG_CHANNEL)
+            _LOGGER.debug("FRCG open failed: %s", str(err) or type(err).__name__)
+            return
+        if channel.server_channel_id == 0:
+            _LOGGER.debug("FRCG opened without a channel id: not listening")
+            return
+        try:
+            resp = await asyncio.wait_for(
+                client.send_json(
+                    channel,
+                    {
+                        "message": "rcg-get-params",
+                        "message-type": "request",
+                        "message-id": 121,
+                    },
+                ),
+                timeout=_FRCG_REPLY_TIMEOUT,
+            )
+            self._on_frcg_message(resp)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "FRCG: no usable reply to rcg-get-params: %s",
+                str(err) or type(err).__name__,
+            )
+        await self._frcg_read_loop(client, channel)
+
+    async def _frcg_read_loop(
+        self, client: SharedIconaClient, channel: Channel
+    ) -> None:
+        """Relay FRCG notifications until the connection drops or is replaced."""
+        while (
+            not self._shutdown
+            and client.connected
+            and client is self._shared_client
+        ):
+            body = await client.read_response(channel, timeout=_FRCG_POLL)
+            if not body:
+                continue
+            if not is_json_body(body):
+                _LOGGER.debug("FRCG: binary message ignored (%d bytes)", len(body))
+                continue
+            try:
+                self._on_frcg_message(decode_json_body(body))
+            except Exception:  # noqa: BLE001
+                # Never let one odd message stop the reader.
+                _LOGGER.debug("FRCG: message ignored", exc_info=True)
+
+    def _on_frcg_message(self, msg: Any) -> None:
+        """Handle one FRCG message: parameters, recognition, detected image."""
+        if not isinstance(msg, dict):
+            _LOGGER.debug("FRCG: non-object message ignored")
+            return
+        kind = msg.get("message")
+        if kind in ("rcg-params-result", "rcg-get-params"):
+            params = msg.get("parameters")
+            if isinstance(params, dict):
+                self.face_params = params
+                _LOGGER.info("Face recognition parameters: %s", params)
+            else:
+                _LOGGER.debug("FRCG %s: %s", kind, msg)
+            return
+        if kind == "rcg-detected-recognition":
+            data = _as_dict(msg.get("data"))
+            event = {
+                "type": "recognition",
+                "external_id": data.get("external-id"),
+                "recognized": _as_bool(data.get("recognized")),
+                "activated": _as_bool(data.get("activated")),
+                "similarity": _as_float(data.get("similarity")),
+                "confidence": _as_float(data.get("confidence")),
+                "session_id": data.get("session-id"),
+                # The image URL (a link to the face crop on Comelit's cloud) is
+                # deliberately not forwarded: events are stored by the recorder.
+                "has_image": bool(data.get("image-url")),
+            }
+            _LOGGER.debug("Face recognition: %s", event)
+            self.hass.bus.async_fire(EVENT_FACE, event)
+            return
+        if kind == "rcg-detected-image":
+            image = _as_dict(msg.get("image"))
+            event = {
+                "type": "image",
+                "external_id": image.get("external-id"),
+                "path": image.get("path"),
+                "changed": _as_bool(image.get("changed")),
+            }
+            _LOGGER.debug("Face detected: %s", event)
+            self.hass.bus.async_fire(EVENT_FACE, event)
+            return
+        # Unknown FRCG traffic: log it so the protocol can be documented.
+        _LOGGER.debug("FRCG message %s: %s", kind, msg)
 
     async def _keepalive_loop(self) -> None:
         """Re-assert the CTPP ring registration every _KEEPALIVE_INTERVAL.
@@ -469,6 +681,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._reconnecting = True
         self._cancel_keepalive()
+        self._cancel_frcg()
         try:
             # Stop the video session first — it holds a reference to the dead
             # client and would otherwise hang waiting on the dead socket.
@@ -521,6 +734,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Disconnect the shared client (on unload)."""
         self._shutdown = True
         self._cancel_keepalive()
+        self._cancel_frcg()
         if self.events_manager is not None:
             with contextlib.suppress(Exception):
                 await self.events_manager.async_detach_local()
