@@ -116,6 +116,17 @@ The doorbell `event` carries `source`, `doorbell`, and `caller` attributes; a
 `comelit_intercom_doorbell` bus event fires for every ring (catch-all for
 automations).
 
+**Face recognition (opt-in).** On monitors with face recognition (e.g. 6741W),
+enable **Face recognition events** in the options to get a
+`comelit_intercom_face` bus event for each result of the monitor's own
+recognition: `type: recognition` with `external_id`, `recognized`, `activated`,
+`similarity`, `confidence`, `session_id`, `has_image`, and `type: image` with
+`external_id`, `path`, `changed`. The match is made by the monitor with
+Comelit's cloud. A face is not an identity proof (a photo can fool it): don't
+use these events to open doors or disarm alarms. `activated: true` means the
+monitor itself ran its configured action (lock release is on by default; check
+the monitor's face-recognition actions).
+
 ## How doorbell events work
 
 On current firmware the wall monitor receives calls over the native ViP bus,
@@ -181,6 +192,8 @@ Integration → **Configure**:
 - **Auto-answer doorbell** — automatically answer an incoming call so two-way
   audio (talk-back) is available. Experimental, off by default; on shared /
   multi-unit systems it can affect other units.
+- **Face recognition events**: relay the monitor's face-recognition results as
+  `comelit_intercom_face` events (models that advertise it). Off by default.
 - **Verbose debug logging** — log protocol/video/audio internals for bug reports.
 - **Push identity token** — advanced: enroll cloud push under a different token.
 

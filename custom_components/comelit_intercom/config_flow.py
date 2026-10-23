@@ -20,6 +20,7 @@ from .const import (
     CONF_AUTO_ANSWER,
     CONF_ENABLE_AUDIO,
     CONF_ENABLE_NOTIFICATIONS,
+    CONF_FACE_RECOGNITION,
     CONF_PUSH_TOKEN,
     CONF_USER_MATCH,
     CONF_VERBOSE_LOGGING,
@@ -415,6 +416,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_AUTO_ANSWER,
                     default=options.get(CONF_AUTO_ANSWER, False),
+                ): bool,
+                vol.Optional(
+                    CONF_FACE_RECOGNITION,
+                    default=options.get(CONF_FACE_RECOGNITION, False),
                 ): bool,
                 vol.Optional(
                     CONF_VERBOSE_LOGGING,

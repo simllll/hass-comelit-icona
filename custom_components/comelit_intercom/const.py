@@ -53,6 +53,9 @@ CONF_ENABLE_AUDIO = "enable_audio"
 # Experimental: when the doorbell rings, automatically answer the incoming
 # call (inbound two-way audio, PCAP-derived). Off by default.
 CONF_AUTO_ANSWER = "auto_answer"
+# Opt-in: relay the monitor's face-recognition notifications (FRCG channel)
+# as comelit_intercom_face bus events. Off by default.
+CONF_FACE_RECOGNITION = "face_recognition"
 
 FCM_PROJECT_ID = "friend-home-55eb5"
 FCM_APP_ID = "1:140273510303:android:ecb227a626746c69"
@@ -69,3 +72,8 @@ STORAGE_KEY_FCM = "comelit_intercom_fcm"
 
 # HA event fired on the bus when the doorbell rings.
 EVENT_DOORBELL = "comelit_intercom_doorbell"
+
+# HA event fired on the bus for the monitor's face-recognition notifications
+# (FRCG channel): "recognition" (rcg-detected-recognition) and "image"
+# (rcg-detected-image).
+EVENT_FACE = "comelit_intercom_face"
