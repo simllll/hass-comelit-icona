@@ -4,6 +4,13 @@ This file is maintained automatically by
 [release-please](https://github.com/googleapis/release-please) from
 [Conventional Commit](https://www.conventionalcommits.org/) messages.
 
+## [1.13.4](https://github.com/simllll/hass-comelit-icona/compare/v1.13.3...v1.13.4) (2026-11-16)
+
+
+### Bug Fixes
+
+* drop aiohttp from manifest requirements ([#74](https://github.com/simllll/hass-comelit-icona/issues/74)) ([a511480](https://github.com/simllll/hass-comelit-icona/commit/a511480ca3f3a8021fe580c48d98249e172240ac))
+
 ## [1.13.3](https://github.com/simllll/hass-comelit-icona/compare/v1.13.2...v1.13.3) (2026-09-22)
 
 
