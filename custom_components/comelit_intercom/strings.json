@@ -124,11 +124,11 @@
         },
         "language": {
           "name": "Language",
-          "description": "Language of the message. A short tag like \"it\" is matched to what the engine lists (e.g. \"it-IT\")."
+          "description": "Language of the message. Default: Home Assistant's language. A short tag like \"en\" is matched to what the engine lists (e.g. \"en-US\")."
         },
         "voice": {
           "name": "Voice",
-          "description": "Engine voice. Default: a female voice on Google AI (kore) and OpenAI (nova); the engine's own default elsewhere."
+          "description": "Engine voice. Default: the engine's own. A clear, firm voice carries best through the panel's small speaker (e.g. \"kore\" on Google AI, \"nova\" on OpenAI)."
         },
         "options": {
           "name": "TTS options",

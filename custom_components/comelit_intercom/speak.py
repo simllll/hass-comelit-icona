@@ -10,7 +10,8 @@ In mode "answer" the call is answered first and the audio is built meanwhile
 (silence until it is ready): the monitor takes the call about 1 s after a
 face is recognised. Built frames are kept in a small in-memory cache, and
 ``prepare_only`` builds them without any call (to warm the cache up).
-With ``open_door`` the door is opened inside the same call after the audio.
+With ``open_door`` the door is opened after the audio (inside the ring's call
+in mode "answer").
 
 Registered as an entity service on the entrance cameras, so automations target
 the entrance by its camera entity. Wrong input raises; runtime conditions
@@ -34,7 +35,6 @@ import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .audio import FRAME_SECONDS, build_frames
@@ -69,7 +69,6 @@ ATTR_PREPARE_ONLY = "prepare_only"
 MODE_CALL = "call"
 MODE_ANSWER = "answer"
 
-DEFAULT_LANGUAGE = "it"
 # Longest audio played; the rest is cut (keeps the call short).
 MAX_AUDIO_SECONDS = 30.0
 _MAX_MEDIA_BYTES = 10 * 1024 * 1024
@@ -80,14 +79,6 @@ _TTS_TIMEOUT = 30.0
 # greetings plus the other messages (courier, announcements).
 _FRAME_CACHE_SIZE = 32
 _FRAME_CACHE: OrderedDict[tuple, list[bytes]] = OrderedDict()
-
-# Female voice used when the call names none, per TTS platform (voice ids as
-# these engines list them). Gemini "Kore" (firm, clear) and OpenAI "Nova"
-# (bright) stay intelligible through the panel's 8 kHz speaker.
-FEMALE_VOICES = {
-    "google_generative_ai_conversation": "kore",
-    "openai_conversation": "nova",
-}
 
 _LOCAL_MEDIA_PREFIX = "media-source://media_source/"
 _TTS_MEDIA_PREFIX = "media-source://tts/"
@@ -111,7 +102,7 @@ SPEAK_SCHEMA: dict[Any, Any] = {
     ),
     vol.Exclusive(ATTR_MEDIA_CONTENT_ID, "audio_source"): cv.string,
     vol.Optional(ATTR_TTS_ENTITY): cv.string,
-    vol.Optional(ATTR_LANGUAGE, default=DEFAULT_LANGUAGE): cv.string,
+    vol.Optional(ATTR_LANGUAGE): cv.string,
     vol.Optional(ATTR_VOICE): cv.string,
     vol.Optional(ATTR_OPTIONS, default=dict): dict,
     vol.Optional(ATTR_CACHE, default=True): cv.boolean,
@@ -310,15 +301,16 @@ def _tts_plan(hass: HomeAssistant, message: str, data: dict[str, Any]) -> _TtsPl
             f"TTS engine not found: {data.get(ATTR_TTS_ENTITY) or '(default)'}"
         )
     instance = get_engine_instance(hass, engine)
-    language = _match_language(engine, instance, data.get(ATTR_LANGUAGE))
+    # Default: Home Assistant's own language, matched quietly to the engine's
+    # tags (an engine without it uses its own default).
+    requested = data.get(ATTR_LANGUAGE)
+    language = _match_language(
+        engine, instance, requested or hass.config.language, warn=bool(requested)
+    )
 
     options = dict(data.get(ATTR_OPTIONS) or {})
     if voice := data.get(ATTR_VOICE):
         options["voice"] = voice
-    elif "voice" not in options and (
-        female := _default_female_voice(hass, engine, instance)
-    ):
-        options["voice"] = female
     # Without a preferred format HA re-encodes every result to mp3; ask for
     # WAV instead (Gemini already returns it, OpenAI produces it natively),
     # so the only lossy step left is the final A-law encoding.
@@ -392,7 +384,9 @@ async def _async_build_audio(
     return _Audio(frames, cached=False, seconds=time.monotonic() - t0)
 
 
-def _match_language(engine: str, instance: Any, language: str | None) -> str | None:
+def _match_language(
+    engine: str, instance: Any, language: str | None, *, warn: bool = True
+) -> str | None:
     """Map a short tag ("it") to what the engine lists ("it-IT").
 
     Engines like Gemini and OpenAI only accept full tags. None means "the
@@ -414,20 +408,11 @@ def _match_language(engine: str, instance: Any, language: str | None) -> str | N
     same = same or [s for s in supported if norm(s).split("-")[0] == base]
     if same:
         return same[0]
-    _LOGGER.warning(
-        "Speak: %s does not list language %s; using its default", engine, language
-    )
+    if warn:
+        _LOGGER.warning(
+            "Speak: %s does not list language %s; using its default", engine, language
+        )
     return None
-
-
-def _default_female_voice(
-    hass: HomeAssistant, engine: str, instance: Any
-) -> str | None:
-    """Female voice for known engines that take a "voice" option."""
-    if "voice" not in (getattr(instance, "supported_options", None) or []):
-        return None
-    entry = er.async_get(hass).async_get(engine)
-    return FEMALE_VOICES.get(entry.platform) if entry is not None else None
 
 
 # --- ready-made media -------------------------------------------------------
