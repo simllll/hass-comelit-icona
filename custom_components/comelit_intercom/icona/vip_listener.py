@@ -58,6 +58,10 @@ ACTION_IDLE = 0x0000
 ACTION_IN_ALERTING = 0x0001  # incoming call / doorbell ring
 ACTION_CALL_INIT = 0x0028  # action carried in 0x18C0 call-init frames
 ACTION_REGISTRATION_RENEWAL = 0x0010  # device keepalive — must ACK 0x1800+0x1820
+# 0x1860/0x0003: door opened / call FSM. Seen live on a 6741W right when the
+# monitor's face recognition released the lock, as the entrance call ended
+# (the panel stopped streaming 150 ms earlier); retransmitted a few times.
+ACTION_DOOR_FSM = 0x0003
 
 MIN_MSG_SIZE = 8
 
@@ -125,8 +129,13 @@ class VipEventListener:
         on_ring: Callable[[dict], None],
         init_ts: int,
         on_inbound_ring: Callable[[str, int], bool] | None = None,
+        on_call_end: Callable[[int], None] | None = None,
     ) -> None:
         self._client = client
+        # Optional: told (with the frame's flags) when a call-ending frame
+        # (0x1860/0x0003) is seen, so the speak service knows when the
+        # entrance panel is free again.
+        self._on_call_end = on_call_end
         self._apt = apt_address
         self._sub = apt_subaddress
         self._our_addr = f"{apt_address}{apt_subaddress}"
@@ -242,6 +251,15 @@ class VipEventListener:
         # Device's periodic registration renewal → answer with ACK pair.
         if prefix == PREFIX_VIP_EVENT and action == ACTION_REGISTRATION_RENEWAL:
             await self._send_renewal_ack(addresses)
+            return
+
+        # Door opened / call FSM: only noted (no ACK change, no event).
+        if prefix == PREFIX_VIP_EVENT and action == ACTION_DOOR_FSM:
+            if self._on_call_end is not None:
+                try:
+                    self._on_call_end(msg.get("flags", 0))
+                except Exception:
+                    _LOGGER.exception("Error in call-end callback")
             return
 
         # Ring: 0x18C0 (call init) or 0x1860/0x0001 (IN_ALERTING).

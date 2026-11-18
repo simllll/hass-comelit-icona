@@ -35,6 +35,11 @@ for ring notifications).
   browser over go2rtc's WebRTC. Answer an incoming call automatically
   (`Auto-answer`) or with the **Answer doorbell** button, then use the mic
   button on a WebRTC card. Opt-in; off by default.
+- 🗣️ **Speak at the entrance (experimental)**: the `comelit_intercom.speak`
+  action says a message (any Home Assistant TTS engine) or plays an audio file
+  on the entrance panel's speaker, answering the ring (e.g. to greet a face the
+  monitor recognised) or in a short call of its own, and can open the door
+  afterwards.
 - 🔑 **Dedicated identity** — use a Home Assistant user paired via the app so it
   doesn't clash with your phone or the wall monitor (needed for local events).
 - 📈 **Sensors** — connectivity, ringing, last ring, ring count, events source.
@@ -116,6 +121,26 @@ The doorbell `event` carries `source`, `doorbell`, and `caller` attributes; a
 `comelit_intercom_doorbell` bus event fires for every ring (catch-all for
 automations).
 
+**Face recognition (opt-in).** On monitors with face recognition (e.g. 6741W),
+enable **Face recognition events** in the options to get a
+`comelit_intercom_face` bus event for each result of the monitor's own
+recognition: `type: recognition` with `external_id`, `recognized`, `activated`,
+`similarity`, `confidence`, `session_id`, `has_image`, and `type: image` with
+`external_id`, `path`, `changed`. The match is made by the monitor with
+Comelit's cloud. A face is not an identity proof (a photo can fool it): don't
+use these events to open doors or disarm alarms. Don't read `activated` as "the
+door was opened" either: on a 6741W it stays `true` even when no action is
+configured for the face on the monitor.
+
+**Opening a door while it rings (opt-in).** A 6741W ignores the usual open
+command while the panel rings. With **Open doors inside the ring's call** on,
+when Home Assistant holds the ring's call (the on-ring snapshot call, or a call
+answered by speak or auto-answer), a door's `lock.open` sends the open inside
+that call, as the app does; a ring that is only being previewed is answered
+first, so the monitor stops ringing. In every other case (no call, live view,
+snapshot, speak `call`), and with the option off, the usual open command is
+sent, as before.
+
 ## How doorbell events work
 
 On current firmware the wall monitor receives calls over the native ViP bus,
@@ -156,6 +181,98 @@ dialog on a recent HA).
   go2rtc's ONVIF backchannel. The browser only grants microphone access on a
   **secure (HTTPS) origin**.
 
+### Speak at the entrance (experimental)
+
+`comelit_intercom.speak` plays a message on the entrance panel's speaker. Target
+the entrance's **camera** entity and give either a `message` (rendered by a
+Home Assistant TTS engine) or a `media_content_id` (a ready audio file: local
+media, a TTS media id, an absolute path in `allowlist_external_dirs` or an
+http(s) URL in `allowlist_external_urls`; redirects are not followed).
+
+The audio is decoded and converted to 8 kHz G.711 A-law (20 ms frames), then
+played in one of two modes:
+
+- **`mode: answer`**: answers the incoming call Home Assistant holds right
+  after a ring (the on-ring snapshot call, or an auto-answered one) **at once**
+  and speaks on it as soon as the audio is ready, with silence meanwhile (on a
+  6741W the monitor takes the call about 1 s after recognising a face, so
+  waiting for the TTS first loses it). With **Face recognition events** on,
+  the on-ring call is held until 16 s after the ring, long enough for the
+  monitor's recognition. Without such a call it falls back to `call`
+  (`answer_fallback: true`, default) or gives up. **Answering takes the call:
+  the monitor stops ringing and may skip its own actions. Test it before
+  automating it.**
+- **`mode: call`** (default): opens a short call to the panel (the same
+  on-demand call the live view uses), answers it, streams the audio and hangs
+  up. It **never interrupts anything**: it waits (up to `max_wait`, default
+  60 s) while the panel is ringing, in a call with the monitor or busy with a
+  live view, and gives up with a log line rather than cut in. If the panel
+  refuses the call, it tries once more 3 s later.
+
+In both modes a ring arriving while it speaks ends the message at once. Speak
+sees rings through the integration's ring events (**Doorbell ring
+notifications**, on by default).
+
+**Tested on a 6741W** (firmware 2.1.0): `answer` is heard, over TCP; on a call
+opened by Home Assistant (`call`) the panel lights up but plays nothing, over
+TCP or UDP. Other models may differ: test at the door first (see
+`docs/PROTOCOL.md` §11).
+
+- **Open the door (`open_door: true`, off by default).** After the message (or
+  right after answering, with no message) the door is opened: in `answer`
+  mode inside the same call (the app's in-call command), in `call` mode with
+  the usual open command. In `answer` mode a new ring during the message cuts
+  it and opens at once; in `call` mode the door then stays shut. `door` picks
+  the door by name (default: the only door of that entrance). Without
+  `open_door` speak never opens anything. This works without the option
+  below: `open_door` is the explicit request.
+- **Faster audio.** Built frames of the last 32 messages stay in memory, so a
+  repeated greeting starts at once. `prepare_only: true` builds and caches a
+  message without any call, e.g. from an automation at startup with the same
+  text and TTS settings; `cache: false` bypasses the cache.
+- **Voice.** `tts_entity` defaults to Home Assistant's default engine and
+  `language` to Home Assistant's language, matched to the engine's tags (`en`
+  becomes `en-US`). `voice` defaults to the engine's own; a clear, firm voice
+  carries best through the panel's small speaker (e.g. `kore` on Google AI
+  TTS, `nova` on OpenAI TTS). Home Assistant caches the TTS result, so a fixed
+  greeting is rendered once.
+- **Response.** The action returns what happened, always with the same keys:
+  `spoken`, `reason`, `mode` (the one used), `fallback`, `answered`,
+  `answered_after` (seconds from the ring), `attempts`, `waited`, `duration`,
+  `rx_audio` (the panel's own audio was seen: its audio path was open),
+  `device_ack`, `transport`, `transport_auto`, `media_transport`,
+  `frames_sent`, `audio_ready_after`, `cached`, `prepared`, `prepare_time`,
+  `door_opened`, `door_ack`, `door_confirmed`, `door_reason`. The lock can trip
+  without `door_ack` or `door_confirmed`: a 6741W sends neither and opens.
+  Wrong input raises; a busy or refusing panel only returns `spoken: false`.
+- **Advanced.** `gain_db` (after normalising to -1 dBFS), `audio_wait` (how
+  long to wait for the panel's audio before playing anyway), `lead_in`,
+  `transport` (`auto`: the transport the call's media arrive on, TCP or UDP,
+  in both modes; a 6741W plays audio only over TCP).
+
+```yaml
+automation:
+  - alias: Greet a recognised face at the entrance
+    triggers:
+      - trigger: event
+        event_type: comelit_intercom_face
+        event_data:
+          type: recognition
+          recognized: true
+    actions:
+      - action: comelit_intercom.speak
+        target:
+          entity_id: camera.comelit_intercom_entrance
+        data:
+          mode: answer
+          answer_fallback: false
+          message: "Welcome home, {{ trigger.event.data.external_id | title }}!"
+        response_variable: speak_result
+```
+
+A face is not an identity proof: keep `open_door` out of automations that rely
+on face recognition alone.
+
 Example — notify with a snapshot on ring:
 
 ```yaml
@@ -181,6 +298,12 @@ Integration → **Configure**:
 - **Auto-answer doorbell** — automatically answer an incoming call so two-way
   audio (talk-back) is available. Experimental, off by default; on shared /
   multi-unit systems it can affect other units.
+- **Face recognition events**: relay the monitor's face-recognition results as
+  `comelit_intercom_face` events (models that advertise it). Off by default.
+- **Open doors inside the ring's call**: while Home Assistant holds a ring's
+  call, `lock.open` opens inside it, answering the preview first (the monitor
+  stops ringing). Needed on a 6741W, which ignores the usual open command while
+  it rings. Off by default.
 - **Verbose debug logging** — log protocol/video/audio internals for bug reports.
 - **Push identity token** — advanced: enroll cloud push under a different token.
 
@@ -197,6 +320,9 @@ Integration → **Configure**:
   WebRTC stream (via go2rtc); HLS players show video only. Talk-back also needs
   an answered call (auto-answer or the Answer button) and an HTTPS origin for the
   browser mic.
+- **Speak is experimental**: it uses the single call slot. In `call` mode it
+  waits for rings, calls and live views to end, and on a 6741W the panel plays
+  no audio on such a call (`answer` works there). Other models are untested.
 
 ## Credits
 

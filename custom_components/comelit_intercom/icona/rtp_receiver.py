@@ -233,6 +233,12 @@ class RtpReceiver:
         if is_verbose_logging():
             _LOGGER.debug("Audio sender started (device_rtpc_req_id=0x%04X)", device_rtpc_req_id)
 
+    def stop_audio_sender(self) -> None:
+        """Stop the silence/mic sender (speak replaces it with its own)."""
+        task, self._audio_sender_task = self._audio_sender_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _audio_send_loop(self, device_rtpc_req_id: int) -> None:
         """Send PCMA audio frames every 20 ms on the existing UDP socket.
 
@@ -272,6 +278,24 @@ class RtpReceiver:
     def audio_sent_count(self) -> int:
         """Number of outbound PCMA audio frames sent to the device."""
         return self._audio_sent_count
+
+    @property
+    def audio_packet_count(self) -> int:
+        """Number of incoming G.711 audio RTP packets (device → us)."""
+        return self._audio_packet_count
+
+    def send_rtp_udp(self, req_id: int, rtp: bytes) -> bool:
+        """Send one RTP packet to the device over the UDP media socket.
+
+        Wrapped in the ICONA header with *req_id* (the device's RTPC channel),
+        exactly like the inbound audio sender. Returns False when the socket
+        is gone (session stopping).
+        """
+        if self._transport is None or self._transport.is_closing():
+            return False
+        header = struct.pack("<BBHH2s", 0x00, 0x06, len(rtp), req_id, b"\x00\x00")
+        self._transport.sendto(header + rtp)
+        return True
 
     def set_media_req_id(self, media_req_id: int) -> None:
         """Set the media request ID once RTPC2 is opened."""

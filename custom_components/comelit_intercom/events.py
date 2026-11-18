@@ -99,6 +99,11 @@ class ComelitEventsManager:
     def source(self) -> str:
         return self._source
 
+    @property
+    def paused_for_video(self) -> bool:
+        """True while a call has borrowed the CTPP channel (listener paused)."""
+        return self._paused_for_video
+
     # --- lifecycle -------------------------------------------------------
     async def async_start(self) -> None:
         """Create the FCM fallback and start the source-selection monitor.
@@ -156,6 +161,7 @@ class ComelitEventsManager:
             self._handle_ring,
             init_ts=self.coordinator.ctpp_init_ts,
             on_inbound_ring=self.coordinator._on_inbound_ring,
+            on_call_end=self.coordinator.stream.note_call_end,
         )
         try:
             await listener.start()
@@ -259,6 +265,10 @@ class ComelitEventsManager:
         payload.setdefault("source", self._source)
         payload.setdefault("event_type", "ring")
         payload["doorbell"] = self._doorbell_name(payload.get("caller"))
+        # Track call activity so the speak service never calls the panel
+        # while it is ringing / in a call with the monitor.
+        if payload["event_type"] == "ring":
+            self.coordinator.stream.note_ring()
         _LOGGER.info(
             "Doorbell ring (source=%s, doorbell=%s)",
             payload.get("source"),

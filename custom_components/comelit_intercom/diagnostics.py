@@ -8,7 +8,12 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_PUSH_TOKEN, CONF_TOKEN
+from .const import (
+    CONF_FACE_RECOGNITION,
+    CONF_OPEN_DOOR_IN_CALL,
+    CONF_PUSH_TOKEN,
+    CONF_TOKEN,
+)
 from .coordinator import ComelitDataUpdateCoordinator
 
 TO_REDACT = {CONF_TOKEN, CONF_PUSH_TOKEN, "user-token", "device-token", "serial-code"}
@@ -42,4 +47,9 @@ async def async_get_config_entry_diagnostics(
             if local
             else None,
         },
+        "face_recognition": {
+            "enabled": entry.options.get(CONF_FACE_RECOGNITION, False),
+            "params": coordinator.face_params,
+        },
+        "open_door_in_call": entry.options.get(CONF_OPEN_DOOR_IN_CALL, False),
     }

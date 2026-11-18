@@ -1,6 +1,10 @@
 {
   "domain": "comelit_intercom",
   "name": "Comelit ICONA Intercom",
+  "after_dependencies": [
+    "media_source",
+    "tts"
+  ],
   "codeowners": [
     "@simllll",
     "@nicolas-fricke"

@@ -71,6 +71,8 @@
           "push_token": "Push identity token (optional)",
           "enable_audio": "Entrance audio (two-way call audio)",
           "auto_answer": "Auto-answer doorbell (experimental two-way)",
+          "face_recognition": "Face recognition events",
+          "open_door_in_call": "Open doors inside the ring's call",
           "verbose_logging": "Verbose debug logging"
         },
         "data_description": {
@@ -78,7 +80,85 @@
           "push_token": "Advanced: enroll push under a different ICONA token so a paired phone keeps its own notifications. Leave empty to use the main token.",
           "enable_audio": "Carry the entrance's G.711 audio in the camera stream (audible via the unmute control in the WebRTC view). Turn off if the audio track disturbs the HLS/video playback. Takes effect on the next stream reconnect.",
           "auto_answer": "Experimental: when the doorbell rings, automatically answer the incoming call (inbound two-way audio). May be unstable and, on shared/multi-unit entries, can affect other units. Leave off unless testing. Takes effect on reload.",
+          "face_recognition": "Relay the monitor's own face-recognition results (models that advertise it, e.g. 6741W) as comelit_intercom_face events. The match is made by the monitor with Comelit's cloud. Takes effect on reload.",
+          "open_door_in_call": "When Home Assistant holds a ring's call (the on-ring preview, or a call answered by speak or auto-answer), a door's open command is sent inside that call, as the app does, answering the preview first: the monitor then stops ringing. Needed on a 6741W, which ignores the usual open command while it rings. Off: the usual open command, as before.",
           "verbose_logging": "Log detailed protocol/video/audio internals (for bug reports). Also enable debug logging on the integration to capture everything."
+        }
+      }
+    }
+  },
+  "services": {
+    "speak": {
+      "name": "Speak at the entrance",
+      "description": "Say a message (text-to-speech) or play an audio file on the entrance panel's speaker. Mode \"call\" opens a short call to the panel, plays the audio and hangs up; it never interrupts a ring, a call or a live view: it waits up to \"Max wait\" for the panel to be free, otherwise it gives up and logs why. Mode \"answer\" answers the incoming call Home Assistant holds after a ring at once and speaks on it as soon as the audio is ready (the monitor may then lose that call). With \"Open the door\" it opens the door afterwards: inside the answered ring's call in mode \"answer\", with the usual open command in mode \"call\"; it never opens otherwise. \"Prepare only\" builds and caches the audio without any call. Experimental. Returns the outcome (spoken, door, reason, timings).",
+      "fields": {
+        "mode": {
+          "name": "Mode",
+          "description": "\"call\": open a new call once the panel is free. \"answer\": answer the incoming call of the current ring and speak on it (test it first: the monitor may lose the call, e.g. not open the gate)."
+        },
+        "answer_fallback": {
+          "name": "Fall back to call",
+          "description": "With mode \"answer\" and no incoming call to answer: open a new call instead (on) or give up (off)."
+        },
+        "open_door": {
+          "name": "Open the door",
+          "description": "After the message (or right after answering, with no message), open the door. Mode \"answer\": inside the answered call, waiting at most 2 s for the panel's ACK and call end, then hang up (a 6741W sends neither and opens anyway). Mode \"call\": the usual open command, as the lock does. Off by default: without it the door is never opened."
+        },
+        "door": {
+          "name": "Door",
+          "description": "Name of the door to open (as in the device's opendoor address book). Default: the only door on this entrance."
+        },
+        "prepare_only": {
+          "name": "Prepare only",
+          "description": "Only build the audio and keep it in memory (no call), so a later speak with the same message starts at once. For warm-up automations."
+        },
+        "message": {
+          "name": "Message",
+          "description": "Text to say. Give this or a media content ID (or neither, with \"Open the door\")."
+        },
+        "media_content_id": {
+          "name": "Media content ID",
+          "description": "Ready-made audio instead of a message: a media-source ID (local media or TTS), an absolute path in an allowed folder (allowlist_external_dirs) or an http(s) URL listed in allowlist_external_urls."
+        },
+        "tts_entity": {
+          "name": "TTS engine",
+          "description": "Text-to-speech entity (or legacy engine name). Default: Home Assistant's default engine."
+        },
+        "language": {
+          "name": "Language",
+          "description": "Language of the message. Default: Home Assistant's language. A short tag like \"en\" is matched to what the engine lists (e.g. \"en-US\")."
+        },
+        "voice": {
+          "name": "Voice",
+          "description": "Engine voice. Default: the engine's own. A clear, firm voice carries best through the panel's small speaker (e.g. \"kore\" on Google AI, \"nova\" on OpenAI)."
+        },
+        "options": {
+          "name": "TTS options",
+          "description": "Extra options for the TTS engine."
+        },
+        "cache": {
+          "name": "Cache",
+          "description": "Reuse Home Assistant's TTS cache and the audio kept in memory for repeated messages. Off: render the message again."
+        },
+        "gain_db": {
+          "name": "Gain",
+          "description": "Extra gain in dB after normalising the audio to -1 dBFS (negative is quieter, positive may clip)."
+        },
+        "max_wait": {
+          "name": "Max wait",
+          "description": "How long to wait for the entrance to be free (ringing, in a call, live view) before giving up."
+        },
+        "audio_wait": {
+          "name": "Audio wait",
+          "description": "Advanced: after the call is answered, how long to wait for the panel's own audio (proof the audio path is open) before playing anyway."
+        },
+        "lead_in": {
+          "name": "Lead-in",
+          "description": "Advanced: silence sent before the message starts."
+        },
+        "transport": {
+          "name": "Transport",
+          "description": "Advanced: how to send the audio to the panel. \"auto\": the same transport as the call's video (TCP or UDP), in both modes. A 6741W plays the voice only over TCP (over UDP its speaker switches on but stays silent); its video arrives over TCP, so \"auto\" picks TCP."
         }
       }
     }
