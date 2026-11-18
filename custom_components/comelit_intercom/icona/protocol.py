@@ -521,6 +521,31 @@ def encode_answer_peer(
     return bytes(buf)
 
 
+def encode_talk_enable(
+    caller: str,
+    entrance_addr: str,
+    timestamp: int,
+    renewal: bool = False,
+) -> bytes:
+    """Encode the talk-back enable (peer/accept, action 0x70) the app sends.
+
+    Used by outbound "speak" sessions. The app's frame carries a 4-byte flag
+    (``01 00 00 00`` initial, ``00 00 00 00`` renewal) before the separator,
+    i.e. two more zero bytes than the outbound ``encode_answer_peer`` frame:
+
+      [prefix LE16] [timestamp LE32] [inner_len BE16] [0x0070 BE16]
+      [caller\\0] [flag 4 bytes] [0xFFFFFFFF] [caller\\0] [entrance\\0\\0]
+
+    This is the inbound layout of ``encode_answer_peer`` (PCAP2, verified on
+    the inbound answer) with the entrance as callee. The same layout was read
+    from the app's outbound-call-with-audio captures of a 6742W and a 6741W
+    (upstream PR #44, not merged, never confirmed at a door).
+    """
+    return encode_answer_peer(
+        caller, entrance_addr, timestamp, renewal=renewal, inbound=True
+    )
+
+
 def encode_answer_config_ack(
     caller: str,
     entrance_addr: str,

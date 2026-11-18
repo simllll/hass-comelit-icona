@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import struct
 import time
+from collections import deque
 from collections.abc import Callable
 
 from .channels import Channel, ChannelType
@@ -24,6 +26,7 @@ from .protocol import (
     encode_door_open_during_video,
     encode_rtpc2_ready,
     encode_rtpc_link,
+    encode_talk_enable,
     encode_video_config,
 )
 from .rtp_receiver import RtpReceiver
@@ -49,6 +52,16 @@ VIDEO_READY_TIMEOUT = 6.0  # max wait for first media packet after signaling
 _CTR_INCR_BYTE4 = 0x00010000  # only byte[4] increments
 _CTR_INCR_BYTE5 = 0x01000000  # only byte[5] increments
 _CTR_INCR_BOTH = 0x01010000  # both byte[4] and byte[5] increment
+
+# Talk-back (TX audio) on outbound "speak" sessions: G.711 A-law, 8 kHz,
+# 20 ms per RTP packet (160 bytes), PT 8: the same framing as the inbound
+# audio sender and the app.
+_TALK_FRAME_SECONDS = 0.020
+_TALK_SILENCE = bytes([0xD5]) * 160  # A-law code of linear 0
+# Fell this far behind schedule (event-loop stall): resync instead of bursting.
+_TALK_MAX_LAG = 0.2
+# Consecutive send failures (~0.5 s) after which the talk sender gives up.
+_TALK_MAX_ERRORS = 25
 
 
 class VideoCallSession:
@@ -84,6 +97,8 @@ class VideoCallSession:
         on_call_end: Callable[[], None] | None = None,
         on_timeout: Callable[[], None] | None = None,
         on_ring: Callable[[dict], None] | None = None,
+        talk: bool = False,
+        talk_transport: str = "auto",
     ) -> None:
         self._client = client
         self._config = config
@@ -117,6 +132,31 @@ class VideoCallSession:
         # keepalive ACKs don't collide on the wire.
         self._call_counter: int = 0
         self._ctpp_lock: asyncio.Lock = asyncio.Lock()
+        # Talk-back ("speak") mode, outbound only. Once the call is answered
+        # (0x70 sent) a sender streams A-law RTP to the device's own RTPC
+        # channel every 20 ms: queued frames when there are any, silence
+        # otherwise (the app keeps streaming too; some firmware only opens
+        # the audio path while it receives our audio). Off for live view and
+        # snapshots, which stay exactly as before.
+        self._talk = talk
+        self._talk_transport_pref = talk_transport  # "auto" | "tcp" | "udp"
+        self._talk_transport: str | None = None
+        self._answer_sent = asyncio.Event()
+        self._device_rtpc: Channel | None = None
+        self._talk_task: asyncio.Task | None = None
+        self._talk_frames: deque[bytes] = deque()
+        self._talk_sent = 0  # RTP packets sent (speech + silence)
+        self._talk_payload_sent = 0  # queued (speech) frames sent
+        # Diagnostic: the device sent its own 0x70 (it "reciprocates" when it
+        # accepts our audio, per the app captures).
+        self._device_talk_ack = False
+        # Inbound calls (start_inbound): whether call_accepted was sent, and
+        # what a preview needs to be accepted later (speak in "answer" mode).
+        self._inbound = False
+        self._inbound_accepted = False
+        self._inbound_ctx: dict | None = None
+        # Flags of a call-end frame found while answering (the call is over).
+        self.call_already_ended: int | None = None
 
     @property
     def active(self) -> bool:
@@ -439,6 +479,8 @@ class VideoCallSession:
             except TimeoutError:
                 _LOGGER.warning("Device RTPC channel not received within timeout")
                 raise VideoCallError("Device RTPC channel not received")
+            # The device's own RTPC is where our TX audio goes (talk sessions).
+            self._device_rtpc = device_rtpc
 
             # Read and ACK device's CTPP RTPC link (0x1840/0x000A)
             call_counter = await self._ack_device_rtpc_link(client, ctpp, our_addr, entrance_addr, call_counter)
@@ -563,7 +605,13 @@ class VideoCallSession:
         """
         self._active = False
 
-        for task_attr in ("_timeout_task", "_tcp_task", "_tcp_audio_task", "_ctpp_task"):
+        for task_attr in (
+            "_talk_task",
+            "_timeout_task",
+            "_tcp_task",
+            "_tcp_audio_task",
+            "_ctpp_task",
+        ):
             task = getattr(self, task_attr)
             setattr(self, task_attr, None)
             if task and not task.done():
@@ -658,7 +706,25 @@ class VideoCallSession:
                     or (msg_type == PREFIX_VIP_EVENT and action == ACTION_IN_ALERTING)
                 ):
                     self._forward_ring(resp)
+                # The peer frame carries 0x0070 after its inner length (bytes
+                # 8-9), where other frames have their flags.
+                if msg_type in (0x1840, 0x1860) and 0x0070 in (action, sub):
+                    if self._talk and not self._device_talk_ack:
+                        _LOGGER.debug("Talk: device sent its own 0x%04X peer (0x70)", msg_type)
+                    self._device_talk_ack = True
                 if msg_type == 0x1840:
+                    if action == 0x0003 and self._inbound and self._talk:
+                        # Answered incoming call (speak "answer"): CALL_END ends
+                        # it. Never re-establish as an outbound call here.
+                        async with self._ctpp_lock:
+                            call_counter += _CTR_INCR_BYTE5
+                            self._call_counter = call_counter
+                            await client.send_binary(
+                                ctpp, encode_call_response_ack(our_addr, entrance_addr, call_counter)
+                            )
+                        _LOGGER.debug("Talk: incoming call ended by the device (sub=0x%04X)", sub)
+                        self._active = False
+                        return
                     if action == 0x0003:
                         # CALL_END (sub=0x0000 = timer, sub=0x000E = door-open triggered)
                         if is_verbose_logging():
@@ -837,6 +903,9 @@ class VideoCallSession:
         # 6. Wait for device RTPC and ACK its link
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT)
+        if device_rtpc.is_open:
+            # TX audio (talk sessions) follows the device's newest RTPC.
+            self._device_rtpc = device_rtpc
         call_counter = await self._ack_device_rtpc_link(client, ctpp, our_addr, entrance_addr, call_counter)
 
         # 7. HANGUP/ZERO — signals "call accepted" to device (required for renewal)
@@ -848,10 +917,11 @@ class VideoCallSession:
 
         # 8. Renewal peer/accept (0x1860/0x0070) — triggers audio RTPC reopening
         call_counter += _CTR_INCR_BYTE4
-        await client.send_binary(
-            ctpp,
-            encode_answer_peer(our_addr, entrance_addr, call_counter, renewal=True),
-        )
+        if self._talk:
+            renewal_peer = encode_talk_enable(our_addr, entrance_addr, call_counter, renewal=True)
+        else:
+            renewal_peer = encode_answer_peer(our_addr, entrance_addr, call_counter, renewal=True)
+        await client.send_binary(ctpp, renewal_peer)
         if is_verbose_logging():
             _LOGGER.debug("Re-establish: sent renewal peer/accept (0x1860/0x0070)")
 
@@ -909,12 +979,174 @@ class VideoCallSession:
         """
         async with self._ctpp_lock:
             self._call_counter += _CTR_INCR_BYTE4
-            await client.send_binary(
-                ctpp,
-                encode_answer_peer(our_addr, entrance_addr, self._call_counter),
-            )
+            if self._talk:
+                # Talk sessions send the app's own enable frame (4-byte flag).
+                peer = encode_talk_enable(our_addr, entrance_addr, self._call_counter)
+            else:
+                peer = encode_answer_peer(our_addr, entrance_addr, self._call_counter)
+            await client.send_binary(ctpp, peer)
+        self._answer_sent.set()
         if is_verbose_logging():
             _LOGGER.info("Answer peer/accept (0x70) sent — audio should start within ~400ms")
+        if self._talk and self._active:
+            self._start_talk_sender(client)
+
+    # ------------------------------------------------------------------
+    # Talk-back (TX audio) for outbound "speak" sessions
+    # ------------------------------------------------------------------
+
+    @property
+    def talk_mode(self) -> bool:
+        """True for a talk ("speak") session."""
+        return self._talk
+
+    @property
+    def inbound(self) -> bool:
+        """True for a device-initiated (ring) call: preview or answered."""
+        return self._inbound
+
+    @property
+    def inbound_accepted(self) -> bool:
+        """True once call_accepted was sent on an inbound call."""
+        return self._inbound_accepted
+
+    @property
+    def answered(self) -> bool:
+        """True once the 0x70 answer (talk enable) has been sent."""
+        return self._answer_sent.is_set()
+
+    @property
+    def device_talk_ack(self) -> bool:
+        """True if the device sent its own 0x70 during this session."""
+        return self._device_talk_ack
+
+    @property
+    def talk_transport(self) -> str | None:
+        """Transport the talk sender uses ("tcp"/"udp"), None until it starts."""
+        return self._talk_transport
+
+    @property
+    def talk_running(self) -> bool:
+        """True while the talk sender is streaming to the device."""
+        return self._talk_task is not None and not self._talk_task.done()
+
+    @property
+    def talk_pending(self) -> int:
+        """Queued speech frames not yet sent."""
+        return len(self._talk_frames)
+
+    @property
+    def talk_frames_sent(self) -> tuple[int, int]:
+        """(RTP packets sent, of which speech frames)."""
+        return self._talk_sent, self._talk_payload_sent
+
+    async def wait_answered(self, timeout: float) -> bool:
+        """Wait until the 0x70 answer went out (only when video started)."""
+        try:
+            await asyncio.wait_for(self._answer_sent.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    def talk_play(self, frames: list[bytes]) -> None:
+        """Queue 160-byte A-law frames; the sender plays one every 20 ms."""
+        self._talk_frames.extend(frames)
+
+    def stop_talk(self) -> None:
+        """Stop streaming TX audio (the call itself stays up)."""
+        self._talk_frames.clear()
+        task, self._talk_task = self._talk_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _start_talk_sender(self, client: IconaBridgeClient) -> None:
+        """Start the TX sender on the device's RTPC (talk sessions only)."""
+        if self.talk_running or self._device_rtpc is None:
+            if self._device_rtpc is None:
+                _LOGGER.warning("Talk: no device RTPC channel, cannot send audio")
+            return
+        transport = self._talk_transport_pref
+        if transport not in ("tcp", "udp"):
+            # Mirror the device: send the way its media reaches us.
+            rx = self._rtp_receiver
+            tcp = rx.tcp_media_packet_count if rx else 0
+            udp = rx.udp_media_packet_count if rx else 0
+            transport = "tcp" if tcp >= udp else "udp"
+        self._talk_transport = transport
+        self._talk_task = asyncio.create_task(self._talk_send_loop(client, transport))
+        _LOGGER.debug(
+            "Talk: TX audio started over %s to device RTPC 0x%04X",
+            transport.upper(),
+            self._device_rtpc.server_channel_id,
+        )
+
+    async def _talk_send_loop(self, client: IconaBridgeClient, transport: str) -> None:
+        """Stream A-law RTP (PT 8) to the device every 20 ms, drift-free.
+
+        Each tick sends the next queued speech frame, or silence when none is
+        queued, so the panel sees one continuous stream (seq +1, ts +160).
+        Pacing follows absolute deadlines, so the average rate stays at
+        exactly 50 packets/s whatever the event-loop jitter.
+        """
+        ssrc = secrets.randbelow(0x100000000)
+        seq = 0
+        rtp_ts = 0
+        errors = 0
+        loop = asyncio.get_running_loop()
+        next_at = loop.time()
+        try:
+            while self._active:
+                speech = bool(self._talk_frames)
+                payload = self._talk_frames.popleft() if speech else _TALK_SILENCE
+                rtp = struct.pack(">BBHII", 0x80, 0x08, seq, rtp_ts, ssrc) + payload
+                try:
+                    sent = await self._send_talk_rtp(client, transport, rtp)
+                except Exception:  # noqa: BLE001 - keep streaming, count it
+                    sent = False
+                if sent:
+                    errors = 0
+                    self._talk_sent += 1
+                    if speech:
+                        self._talk_payload_sent += 1
+                else:
+                    errors += 1
+                    if errors >= _TALK_MAX_ERRORS:
+                        _LOGGER.warning(
+                            "Talk: %d consecutive TX send failures (%s), stopping",
+                            errors,
+                            transport,
+                        )
+                        return
+                seq = (seq + 1) & 0xFFFF
+                rtp_ts = (rtp_ts + len(payload)) & 0xFFFFFFFF
+                next_at += _TALK_FRAME_SECONDS
+                delay = next_at - loop.time()
+                if delay < -_TALK_MAX_LAG:
+                    next_at = loop.time()
+                    delay = 0.0
+                await asyncio.sleep(max(0.0, delay))
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _LOGGER.debug(
+                "Talk: TX audio stopped (%d packets, %d speech frames)",
+                self._talk_sent,
+                self._talk_payload_sent,
+            )
+
+    async def _send_talk_rtp(
+        self, client: IconaBridgeClient, transport: str, rtp: bytes
+    ) -> bool:
+        """Send one TX RTP packet on the device's current RTPC channel."""
+        device_rtpc = self._device_rtpc
+        if device_rtpc is None or device_rtpc.server_channel_id == 0:
+            return False
+        if transport == "tcp":
+            # ICONA-framed on the shared TCP connection, like RTPC media.
+            await client.send_binary(device_rtpc, rtp)
+            return True
+        rx = self._rtp_receiver
+        return rx is not None and rx.send_rtp_udp(device_rtpc.server_channel_id, rtp)
 
     async def start_inbound(
         self, entrance_addr: str, ring_ts: int, renewal_ack_ts: int = 0,
@@ -935,6 +1167,7 @@ class VideoCallSession:
         no frame arrives (logged). No two-way audio in this mode.
         """
         client = self._client
+        self._inbound = True
         try:
             apt_addr = self._config.apt_address
             apt_sub = self._config.apt_subaddress
@@ -1100,6 +1333,17 @@ class VideoCallSession:
                     self._tcp_inbound_media_router(client, rtpc1, rtpc2, receiver)
                 )
                 self._call_counter = call_counter
+                # What accept_preview needs to answer this call later (speak
+                # in "answer" mode): steps 13-18 continue from here.
+                self._inbound_ctx = {
+                    "ctpp": ctpp,
+                    "our_addr": our_addr,
+                    "our_base_addr": our_base_addr,
+                    "rtpc1": rtpc1,
+                    "media_req_id": media_req_id,
+                    "device_rtpc": device_rtpc,
+                    "renewal_ack_ts": renewal_ack_ts,
+                }
                 self._active = True
                 got_video = await receiver.wait_for_first_video(VIDEO_READY_TIMEOUT)
                 _LOGGER.info(
@@ -1161,6 +1405,8 @@ class VideoCallSession:
             try:
                 await asyncio.wait_for(device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT)
                 self._device_rtpc_req_id = device_rtpc.server_channel_id
+                self._device_rtpc = device_rtpc
+                self._inbound_accepted = True
                 if is_verbose_logging():
                     _LOGGER.debug("Inbound: device RTPC=0x%04X", self._device_rtpc_req_id)
                 # Step 17: Start audio sender immediately — device requires this for video to flow
@@ -1224,6 +1470,137 @@ class VideoCallSession:
             _LOGGER.info(
                 "Inbound call answered — audio sender started (req_id=0x%04X)", self._device_rtpc_req_id
             )
+
+    async def start_talk_inbound(self, transport: str = "auto") -> bool:
+        """Answer the incoming call this session holds and start the talk sender.
+
+        Speak in "answer" mode. A preview (the on-ring snapshot call, no accept
+        sent) is accepted now with steps 13-18 of start_inbound; an already
+        accepted call (auto-answer) only swaps its silence/mic sender for ours.
+        Sends no door command. Returns False when the call can't be answered.
+        """
+        if not self._inbound or not self._active:
+            return False
+        client = self._client
+        self._talk = True
+        # On an answered inbound call the only TX verified so far is UDP (the
+        # inbound audio sender, 6701W), so "auto" means UDP here.
+        self._talk_transport_pref = "udp" if transport == "auto" else transport
+        if not self._inbound_accepted:
+            if not await self._accept_preview(client):
+                return False
+        elif self._rtp_receiver is not None:
+            self._rtp_receiver.stop_audio_sender()  # ours replaces it
+        self._answer_sent.set()
+        self._start_talk_sender(client)
+        return self.talk_running
+
+    async def _accept_preview(self, client: IconaBridgeClient) -> bool:
+        """Accept an inbound call held in preview: start_inbound steps 13-18.
+
+        Same frames and order as the full answer (PCAP2): PEER, call_accepted,
+        ACK the device's RTPC link / peer, wait for its RTPC, then the CTPP
+        monitor. The media router already runs since the preview.
+        """
+        ctx = self._inbound_ctx
+        if ctx is None:
+            _LOGGER.warning("Talk: no preview context, cannot answer the call")
+            return False
+        ctpp = ctx["ctpp"]
+        our_addr = ctx["our_addr"]
+        our_base_addr = ctx["our_base_addr"]
+        renewal_ack_ts = ctx["renewal_ack_ts"]
+
+        # Frames queued while the preview held CTPP (nobody read them): if the
+        # call already ended (door opened, hung up) don't answer it. They go
+        # back in the queue, so the listener still sees them afterwards.
+        backlog: list[bytes] = []
+        while not ctpp.response_queue.empty():
+            backlog.append(ctpp.response_queue.get_nowait())
+        for data in backlog:
+            ctpp.response_queue.put_nowait(data)
+        for data in backlog:
+            if (
+                len(data) >= 10
+                and struct.unpack_from("<H", data, 0)[0] in (0x1840, 0x1860)
+                and struct.unpack_from(">H", data, 6)[0] == 0x0003
+            ):
+                self.call_already_ended = struct.unpack_from(">H", data, 8)[0]
+                _LOGGER.info("Talk: the incoming call already ended, not answering it")
+                return False
+
+        # Steps 13-14: PEER (inbound format) + call_accepted, each +B4.
+        async with self._ctpp_lock:
+            call_counter = (self._call_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+            await client.send_binary(
+                ctpp, encode_answer_peer(our_addr, our_base_addr, call_counter, inbound=True)
+            )
+            call_counter = (call_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+            await client.send_binary(ctpp, encode_call_accepted(our_addr, our_base_addr, call_counter))
+            self._call_counter = call_counter
+
+        # Step 15: ACK 0x1840/0x000A (rtpc link) + 0x1840/0x000E (peer) with
+        # transform(device ts); the device opens its RTPC only after these.
+        acked_rtpc_link = acked_peer = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10.0
+        while not (acked_rtpc_link and acked_peer):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                data = await asyncio.wait_for(ctpp.response_queue.get(), timeout=remaining)
+            except TimeoutError:
+                break
+            if len(data) < 2:
+                continue
+            msg_type = struct.unpack_from("<H", data, 0)[0]
+            action = struct.unpack_from(">H", data, 6)[0] if len(data) >= 8 else 0
+            dev_ts = struct.unpack_from("<I", data, 2)[0] if len(data) >= 6 else 0
+            if msg_type == 0x1840:
+                _rb = bytearray(struct.pack("<I", dev_ts))
+                _rb[0] |= 0x80
+                _rb[2], _rb[3] = _rb[3], (_rb[2] + 1) & 0xFF
+                ack_ts = struct.unpack("<I", bytes(_rb))[0]
+                await client.send_binary(ctpp, encode_call_response_ack(our_addr, our_base_addr, ack_ts))
+                if action == 0x000A:
+                    acked_rtpc_link = True
+                elif action == 0x000E:
+                    acked_peer = True
+            elif msg_type == 0x1860 and action == 0x0010 and renewal_ack_ts:
+                await client.send_binary(
+                    ctpp, encode_call_response_ack(our_addr, our_base_addr, renewal_ack_ts)
+                )
+                await client.send_binary(
+                    ctpp,
+                    encode_call_response_ack(our_addr, our_base_addr, renewal_ack_ts, prefix=0x1820),
+                )
+
+        # Step 16: the device's RTPC: our TX audio goes there.
+        device_rtpc = ctx["device_rtpc"]
+        try:
+            await asyncio.wait_for(device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.warning("Talk: device RTPC not opened after the answer")
+            return False
+        self._device_rtpc = device_rtpc
+        self._device_rtpc_req_id = device_rtpc.server_channel_id
+        self._inbound_accepted = True
+
+        # Step 18 (CTPP part): ACK keepalives, forward new rings.
+        self._ctpp_task = asyncio.create_task(
+            self._ctpp_monitor_loop(
+                client,
+                ctpp,
+                our_addr,
+                our_base_addr,
+                self._call_counter,
+                ctx["rtpc1"].server_channel_id,
+                ctx["media_req_id"],
+            )
+        )
+        _LOGGER.debug("Talk: incoming call answered (device RTPC 0x%04X)", self._device_rtpc_req_id)
+        return True
 
     @staticmethod
     async def _tcp_inbound_media_router(

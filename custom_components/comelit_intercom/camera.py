@@ -16,7 +16,8 @@ from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, SupportsResponse, callback
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -24,6 +25,7 @@ from .coordinator import ComelitDataUpdateCoordinator
 from .entity import ComelitEntity
 from .events import address_matches
 from .fcm_push import signal_doorbell, signal_snapshot
+from .speak import SERVICE_SPEAK, SPEAK_SCHEMA, async_speak
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +56,15 @@ async def async_setup_entry(
             ComelitEntranceCamera(coordinator, ent.get("name") or "Entrance", addr)
         )
     async_add_entities(entities)
+
+    # comelit_intercom.speak: say a message / play audio on the entrance whose
+    # camera is targeted (registered once, shared by all config entries).
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        SERVICE_SPEAK,
+        SPEAK_SCHEMA,
+        "async_speak",
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
 
 class ComelitEntranceCamera(ComelitEntity, Camera):
@@ -126,6 +137,10 @@ class ComelitEntranceCamera(ComelitEntity, Camera):
         if self._ring_event is not None:
             self._ring_event.set()
         self.async_write_ha_state()
+
+    async def async_speak(self, **kwargs: Any) -> dict[str, Any]:
+        """Say a message (TTS) or play audio on this entrance's speaker."""
+        return await async_speak(self.hass, self.coordinator, self._entrance, kwargs)
 
     async def stream_source(self) -> str | None:
         """Return the local RTSP URL for live view (starts the call if needed).

@@ -84,5 +84,69 @@
         }
       }
     }
+  },
+  "services": {
+    "speak": {
+      "name": "Speak at the entrance",
+      "description": "Say a message (text-to-speech) or play an audio file on the entrance panel's speaker. Mode \"call\" opens a short call to the panel, plays the audio and hangs up; it never interrupts a ring, a call or a live view: it waits up to \"Max wait\" for the panel to be free, otherwise it gives up and logs why. Mode \"answer\" answers the incoming call Home Assistant holds after a ring and speaks on it (the monitor may then lose that call). Experimental. Never opens a door. Returns the outcome (spoken, reason, timings).",
+      "fields": {
+        "mode": {
+          "name": "Mode",
+          "description": "\"call\": open a new call once the panel is free. \"answer\": answer the incoming call of the current ring and speak on it (test it first: the monitor may lose the call, e.g. not open the gate)."
+        },
+        "answer_fallback": {
+          "name": "Fall back to call",
+          "description": "With mode \"answer\" and no incoming call to answer: open a new call instead (on) or give up (off)."
+        },
+        "message": {
+          "name": "Message",
+          "description": "Text to say. Give this or a media content ID."
+        },
+        "media_content_id": {
+          "name": "Media content ID",
+          "description": "Ready-made audio instead of a message: a media-source ID (local media or TTS), an absolute path in an allowed folder (allowlist_external_dirs) or an http(s) URL listed in allowlist_external_urls."
+        },
+        "tts_entity": {
+          "name": "TTS engine",
+          "description": "Text-to-speech entity (or legacy engine name). Default: Home Assistant's default engine."
+        },
+        "language": {
+          "name": "Language",
+          "description": "Language of the message. A short tag like \"it\" is matched to what the engine lists (e.g. \"it-IT\")."
+        },
+        "voice": {
+          "name": "Voice",
+          "description": "Engine voice. Default: a female voice on Google AI (kore) and OpenAI (nova); the engine's own default elsewhere."
+        },
+        "options": {
+          "name": "TTS options",
+          "description": "Extra options for the TTS engine."
+        },
+        "cache": {
+          "name": "Cache",
+          "description": "Reuse Home Assistant's TTS cache for repeated messages."
+        },
+        "gain_db": {
+          "name": "Gain",
+          "description": "Extra gain in dB after normalising the audio to -1 dBFS (negative is quieter, positive may clip)."
+        },
+        "max_wait": {
+          "name": "Max wait",
+          "description": "How long to wait for the entrance to be free (ringing, in a call, live view) before giving up."
+        },
+        "audio_wait": {
+          "name": "Audio wait",
+          "description": "Advanced: after the call is answered, how long to wait for the panel's own audio (proof the audio path is open) before playing anyway."
+        },
+        "lead_in": {
+          "name": "Lead-in",
+          "description": "Advanced: silence sent before the message starts."
+        },
+        "transport": {
+          "name": "Transport",
+          "description": "Advanced: how to send the audio to the panel. \"auto\": in mode \"call\" the same transport as the panel's video (TCP or UDP); in mode \"answer\" UDP, the path already used on answered incoming calls."
+        }
+      }
+    }
   }
 }
