@@ -88,7 +88,7 @@
   "services": {
     "speak": {
       "name": "Speak at the entrance",
-      "description": "Say a message (text-to-speech) or play an audio file on the entrance panel's speaker. Mode \"call\" opens a short call to the panel, plays the audio and hangs up; it never interrupts a ring, a call or a live view: it waits up to \"Max wait\" for the panel to be free, otherwise it gives up and logs why. Mode \"answer\" answers the incoming call Home Assistant holds after a ring and speaks on it (the monitor may then lose that call). Experimental. Never opens a door. Returns the outcome (spoken, reason, timings).",
+      "description": "Say a message (text-to-speech) or play an audio file on the entrance panel's speaker. Mode \"call\" opens a short call to the panel, plays the audio and hangs up; it never interrupts a ring, a call or a live view: it waits up to \"Max wait\" for the panel to be free, otherwise it gives up and logs why. Mode \"answer\" answers the incoming call Home Assistant holds after a ring at once and speaks on it as soon as the audio is ready (the monitor may then lose that call). With \"Open the door\" it opens the door inside the same call afterwards; it never opens otherwise. \"Prepare only\" builds and caches the audio without any call. Experimental. Returns the outcome (spoken, door, reason, timings).",
       "fields": {
         "mode": {
           "name": "Mode",
@@ -98,9 +98,21 @@
           "name": "Fall back to call",
           "description": "With mode \"answer\" and no incoming call to answer: open a new call instead (on) or give up (off)."
         },
+        "open_door": {
+          "name": "Open the door",
+          "description": "After the message (or right after answering, with no message), open the door inside the same call and wait for the panel's ACK. Off by default: without it the door is never opened."
+        },
+        "door": {
+          "name": "Door",
+          "description": "Name of the door to open (as in the device's opendoor address book). Default: the only door on this entrance."
+        },
+        "prepare_only": {
+          "name": "Prepare only",
+          "description": "Only build the audio and keep it in memory (no call), so a later speak with the same message starts at once. For warm-up automations."
+        },
         "message": {
           "name": "Message",
-          "description": "Text to say. Give this or a media content ID."
+          "description": "Text to say. Give this or a media content ID (or neither, with \"Open the door\")."
         },
         "media_content_id": {
           "name": "Media content ID",

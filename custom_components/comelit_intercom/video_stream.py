@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +81,21 @@ _SPEAK_TAIL = 0.6
 # Grace on top of the audio length before playback is declared stuck.
 _SPEAK_PLAY_GRACE = 5.0
 _SPEAK_FRAME_SECONDS = 0.020
+# Answer mode answers first: this long at most for the audio (TTS + decode)
+# to be ready while the answered call carries silence.
+_SPEAK_AUDIO_TIMEOUT = 35.0
+
+# --- door open inside the call (0x1840/0x000D) ---------------------------
+# After answering a ring only to open the door, let the answer settle.
+_DOOR_AFTER_ANSWER = 0.5
+# After the door command, wait this long for the panel's own CALL_END sub
+# 0x000E (the relay fired: the real confirmation, PCAP of the app) before
+# hanging up locally. The panel retransmits an unacknowledged frame at about
+# +0.45, +1.45 and +3.4 s (log of 23/10): 4 s covers the first three copies
+# and keeps a dashboard button press short.
+_DOOR_CONFIRM_TIMEOUT = 4.0
+# Bound on answering a ring preview before an in-call door open.
+_DOOR_ANSWER_TIMEOUT = 20.0
 
 
 def speak_result(
@@ -101,6 +116,14 @@ def speak_result(
         "device_ack": False,
         "transport": None,
         "frames_sent": 0,
+        "audio_ready_after": None,  # answer mode: seconds from answer to audio
+        "cached": False,  # frames from the in-memory cache (set by speak.py)
+        "prepared": False,  # prepare_only: frames built and cached, no call
+        "prepare_time": None,  # seconds spent building the frames
+        "door_opened": False,  # open_door: 0x1840/0x000D sent in the call
+        "door_ack": False,  # the panel ACKed it (not proof the relay tripped)
+        "door_confirmed": False,  # the panel ended the call: the relay fired
+        "door_reason": "",
     }
 
 
@@ -113,6 +136,12 @@ class _SpeakRun:
     starting: bool = False  # a talk call start paused the listener
     retry: bool = False  # the last attempt may be retried
     inbound: bool = False  # run.session is an answered incoming call
+
+
+def _relay_of(door: dict[str, Any]) -> int:
+    """The door's relay (output-index) as is, 0 included; 1 when missing."""
+    index = door.get("output-index")
+    return int(index) if index is not None else 1
 
 
 def _same_address(a: str, b: str) -> bool:
@@ -164,6 +193,9 @@ class ComelitStreamManager:
         self._speaking = False
         # The call speak is actually using (talk call or answered ring).
         self._speak_session: VideoCallSession | None = None
+        # Calls being set up: they pause the listener before taking the CTPP
+        # lock, so they hold CTPP before self._session is set.
+        self._starting = 0
 
     @property
     def session_active(self) -> bool:
@@ -267,6 +299,15 @@ class ComelitStreamManager:
     async def _start_session(
         self, entrance: str, talk: bool = False, talk_transport: str = "auto"
     ) -> None:
+        self._starting += 1
+        try:
+            await self._start_session_inner(entrance, talk, talk_transport)
+        finally:
+            self._starting -= 1
+
+    async def _start_session_inner(
+        self, entrance: str, talk: bool, talk_transport: str
+    ) -> None:
         # Reuse the coordinator's single shared, authenticated ICONA client and
         # its already-open CTPP registration — never open a second connection
         # or a second CTPP (two CTPP registrations make the device drop video).
@@ -344,55 +385,71 @@ class ComelitStreamManager:
             if self._server is None:
                 self._server = LocalRtspServer()
                 await self._server.start()
-
-            # Pause the doorbell listener so the answer sequence owns CTPP.
-            events = self._coordinator.events_manager
-            if events is not None:
-                with contextlib.suppress(Exception):
-                    await events.async_pause_local()
-
-            async with self._coordinator.ctpp_lock:
-                vip = self._vip() or {}
-                config = DeviceConfig(
-                    apt_address=vip.get("apt-address", ""),
-                    apt_subaddress=vip.get("apt-subaddress", 0),
-                    caller_address=entrance,
+            self._starting += 1
+            try:
+                return await self._start_inbound_locked(
+                    client, entrance, ring_ts, renewal_ack_ts, preview_only
                 )
-                self._server.reset()
-                on_ring = events.handle_ring if events is not None else None
-                session = VideoCallSession(
-                    client,
-                    config,
-                    auto_timeout=True,
-                    rtsp_server=self._server,
-                    on_ring=on_ring,
-                )
-                try:
-                    await session.start_inbound(
-                        entrance, ring_ts, renewal_ack_ts=renewal_ack_ts,
-                        preview_only=preview_only,
-                    )
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.warning("Inbound call answer failed: %s", err)
-                    with contextlib.suppress(Exception):
-                        await session.stop()
-                    # Hand CTPP back to the doorbell listener.
-                    if events is not None:
-                        with contextlib.suppress(Exception):
-                            await events.async_resume_local()
-                    return False
-                self._session = session
+            finally:
+                self._starting -= 1
 
-            self._server.mark_ready()
-            self._entrance = entrance
-            self._touch()
-            self._arm_idle_monitor()
-            _LOGGER.info(
-                "Inbound video %s (entrance %s)",
-                "preview started (no accept)" if preview_only else "call answered",
-                entrance,
+    async def _start_inbound_locked(
+        self,
+        client: SharedIconaClient,
+        entrance: str,
+        ring_ts: int,
+        renewal_ack_ts: int,
+        preview_only: bool,
+    ) -> bool:
+        """Body of async_start_inbound (holding the stream lock)."""
+        # Pause the doorbell listener so the answer sequence owns CTPP.
+        events = self._coordinator.events_manager
+        if events is not None:
+            with contextlib.suppress(Exception):
+                await events.async_pause_local()
+
+        async with self._coordinator.ctpp_lock:
+            vip = self._vip() or {}
+            config = DeviceConfig(
+                apt_address=vip.get("apt-address", ""),
+                apt_subaddress=vip.get("apt-subaddress", 0),
+                caller_address=entrance,
             )
-            return True
+            self._server.reset()
+            on_ring = events.handle_ring if events is not None else None
+            session = VideoCallSession(
+                client,
+                config,
+                auto_timeout=True,
+                rtsp_server=self._server,
+                on_ring=on_ring,
+            )
+            try:
+                await session.start_inbound(
+                    entrance, ring_ts, renewal_ack_ts=renewal_ack_ts,
+                    preview_only=preview_only,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Inbound call answer failed: %s", err)
+                with contextlib.suppress(Exception):
+                    await session.stop()
+                # Hand CTPP back to the doorbell listener.
+                if events is not None:
+                    with contextlib.suppress(Exception):
+                        await events.async_resume_local()
+                return False
+            self._session = session
+
+        self._server.mark_ready()
+        self._entrance = entrance
+        self._touch()
+        self._arm_idle_monitor()
+        _LOGGER.info(
+            "Inbound video %s (entrance %s)",
+            "preview started (no accept)" if preview_only else "call answered",
+            entrance,
+        )
+        return True
 
     async def async_answer_inbound(self) -> bool:
         """Start two-way audio (TX) for the active inbound call."""
@@ -452,6 +509,8 @@ class ComelitStreamManager:
             if server is None or server.client_count > 0:
                 return
             if self._speak_owns_session():
+                return
+            if self._session is None:  # already closed (speak, door open)
                 return
             if self._last_stream_request > ring_at:
                 return
@@ -523,11 +582,124 @@ class ComelitStreamManager:
         if task is not None and not task.done():
             task.cancel()
 
+    @property
+    def holds_ctpp(self) -> bool:
+        """True while a call (any state, starting too) holds the CTPP channel."""
+        return self._session is not None or self._starting > 0
+
+    def _door_addresses(self) -> tuple[str, str]:
+        """(our full VIP address, apartment address) for door frames."""
+        vip = self._vip() or {}
+        apt = str(vip.get("apt-address", ""))
+        return f"{apt}{vip.get('apt-subaddress', 0)}", apt
+
+    async def async_open_door_in_call(self, door: dict[str, Any]) -> dict[str, Any] | None:
+        """Open *door* inside the call HA holds with the door's entrance.
+
+        None: there is no such call (the caller uses the idle TAP path).
+        Otherwise a dict: sent, ack, answered (HA answered the ring preview
+        to open), ended (the ring's call was already over: the preview is
+        hung up and the caller may fall back), event_flags, reason.
+
+        A ring preview is answered first, with the same frames as speak's
+        answer: on 26/10 the panel ignored a TAP open sent during the ring,
+        and 0x1840/0x000D is only verified inside a call HA has answered
+        (outbound live view, app PCAP). A call answered only for this is
+        closed afterwards, unless speak or a viewer uses it.
+        """
+        door_addr = str(door.get("apt-address") or "")
+        relay = _relay_of(door)
+        our_addr, apt_addr = self._door_addresses()
+        out: dict[str, Any] = {
+            "sent": False,
+            "ack": False,
+            "confirmed": False,  # the panel ended the call: the relay fired
+            "inbound": False,  # the call is a ring's (no TAP fallback then)
+            "answered": False,
+            "ended": False,
+            "event_flags": None,
+            "reason": "",
+        }
+        async with self._lock:
+            session = self._session
+            if (
+                session is None
+                or not session.active
+                or not _same_address(door_addr, self._entrance or "")
+            ):
+                return None
+            out["inbound"] = session.inbound
+            if session.inbound and not session.inbound_accepted:
+                try:
+                    ok = await asyncio.wait_for(
+                        session.accept_inbound(), timeout=_DOOR_ANSWER_TIMEOUT
+                    )
+                except Exception as err:  # noqa: BLE001
+                    ok = False
+                    out["reason"] = f"could not answer the call: {str(err) or type(err).__name__}"
+                if not ok:
+                    if session.call_already_ended is not None:
+                        out["ended"] = True
+                        out["reason"] = "the ring's call already ended"
+                    elif not out["reason"]:
+                        out["reason"] = "could not answer the call"
+                    if not self._speak_owns_session() and self._session is session:
+                        await self._stop_session("door: call not answered")
+                        self._cancel_idle_monitor()
+                    return out
+                # (if speak owns the call, it answered it and sends the audio)
+                out["answered"] = not self._speak_owns_session()
+                if out["answered"]:
+                    # A normal answer streams our audio (silence / browser
+                    # mic), as after the Answer doorbell button.
+                    session.answer_inbound()
+                await asyncio.sleep(_DOOR_AFTER_ANSWER)
+            try:
+                ack, flags = await session.open_door_in_call(
+                    our_addr, door_addr, relay, apt_addr
+                )
+            except Exception as err:  # noqa: BLE001
+                out["reason"] = f"in-call open failed: {str(err) or type(err).__name__}"
+                return out
+            server = self._server
+            viewers = server is not None and server.client_count > 0
+            closing = out["answered"] and not self._speak_owns_session() and not viewers
+            if closing or (not session.inbound and not ack):
+                # Wait for the real confirmation: the panel ends the call
+                # (CALL_END 0x000E) when the relay fires. Before hanging up a
+                # call answered only for this; on an outbound call without ACK
+                # it decides the TAP fallback (E1).
+                await self._wait_door_confirmed(session)
+            confirmed = session.door_confirmed
+            out.update(
+                sent=True,
+                ack=ack,
+                confirmed=confirmed,
+                event_flags=flags,
+                reason="confirmed" if confirmed else "ok" if ack else "no ACK from the panel",
+            )
+            if closing and self._session is session:
+                await self._stop_session("door opened")
+                self._cancel_idle_monitor()
+            return out
+
+    async def _wait_door_confirmed(self, session: VideoCallSession) -> None:
+        """Up to _DOOR_CONFIRM_TIMEOUT for the panel's CALL_END after the door."""
+        deadline = self.hass.loop.time() + _DOOR_CONFIRM_TIMEOUT
+        while (
+            session.active
+            and not session.door_confirmed
+            and self.hass.loop.time() < deadline
+        ):
+            await asyncio.sleep(0.1)
+
     async def async_speak(
         self,
         entrance: str,
-        frames: list[bytes],
+        frames: list[bytes] | None = None,
         *,
+        audio: Awaitable[list[bytes]] | None = None,
+        door: dict[str, Any] | None = None,
         mode: str = "call",
         answer_fallback: bool = True,
         max_wait: float,
@@ -535,14 +707,19 @@ class ComelitStreamManager:
         lead_in: float,
         transport: str = "auto",
     ) -> dict[str, Any]:
-        """Play the A-law *frames* on the speaker of *entrance*.
+        """Play A-law audio on the speaker of *entrance*, then maybe open.
 
+        The audio is *frames*, or *audio* (an awaitable that builds them).
         mode "call": open a short outbound call once the panel is free (waits
         up to *max_wait* while a ring, a call or another session keeps it busy,
         then gives up rather than interrupt), answer it, play, hang up.
         mode "answer": answer the incoming call HA holds right now (the on-ring
-        preview, or an auto-answered call) and play on it; with no such call,
-        fall back to "call" when *answer_fallback*, else give up.
+        preview, or an auto-answered call) AT ONCE and play on it as soon as
+        the audio is ready (silence meanwhile); with no such call, fall back
+        to "call" when *answer_fallback*, else give up.
+        *door* (an opendoor-address-book entry): after the audio, or right
+        after the answer when there is none, open it inside the same call
+        (0x1840/0x000D) and wait for the panel's ACK; never otherwise.
 
         After the answer, silence is streamed and, up to *audio_wait*, the
         panel's own audio is awaited as proof the audio path is open; then
@@ -552,9 +729,9 @@ class ComelitStreamManager:
         """
         loop = self.hass.loop
         result = speak_result(
-            mode=mode, duration=round(len(frames) * _SPEAK_FRAME_SECONDS, 2)
+            mode=mode, duration=round(len(frames or []) * _SPEAK_FRAME_SECONDS, 2)
         )
-        if not frames:
+        if not frames and audio is None and door is None:
             result["reason"] = "no audio to play"
             return result
         if self._coordinator.events_manager is None:
@@ -577,8 +754,8 @@ class ComelitStreamManager:
         try:
             if mode == "answer":
                 if await self._speak_answer(entrance, transport, run, result):
-                    return await self._speak_play(
-                        run, frames, audio_wait, lead_in, result
+                    return await self._speak_on_call(
+                        run, frames, audio, door, audio_wait, lead_in, result
                     )
                 if result["reason"]:  # there was a call, answering it failed
                     return result
@@ -589,14 +766,129 @@ class ComelitStreamManager:
                 _LOGGER.info("Speak: no incoming call to answer, calling instead")
                 result["mode"] = "call"
                 result["fallback"] = True
+            if not frames and audio is not None:
+                # Call mode builds the audio before calling: no call is held
+                # open while the TTS runs.
+                frames = await self._speak_resolve_audio(audio, result)
+                if not frames and door is None:
+                    return result
             if await self._speak_call(entrance, transport, t0, max_wait, run, result):
-                return await self._speak_play(run, frames, audio_wait, lead_in, result)
+                return await self._speak_on_call(
+                    run, frames, None, door, audio_wait, lead_in, result
+                )
             return result
         finally:
             try:
                 await self._speak_cleanup(run, result)
             finally:
                 self._speak_lock.release()
+
+    async def _speak_resolve_audio(
+        self, audio: Awaitable[list[bytes]], result: dict[str, Any]
+    ) -> list[bytes] | None:
+        """Await the audio builder; None (reason set) when it fails or is empty."""
+        try:
+            frames = await audio
+        except Exception as err:  # noqa: BLE001
+            result["reason"] = f"audio not available: {str(err) or type(err).__name__}"
+            _LOGGER.warning("Speak: %s", result["reason"])
+            return None
+        if not frames:
+            result["reason"] = "the audio is empty or silent"
+            return None
+        result["duration"] = round(len(frames) * _SPEAK_FRAME_SECONDS, 2)
+        return frames
+
+    async def _speak_await_audio(
+        self, run: _SpeakRun, audio: Awaitable[list[bytes]], result: dict[str, Any]
+    ) -> list[bytes] | None:
+        """Answer mode: wait for the audio while the answered call carries silence."""
+        loop = self.hass.loop
+        session = run.session
+        assert session is not None
+        task = asyncio.ensure_future(audio)
+        deadline = loop.time() + _SPEAK_AUDIO_TIMEOUT
+        while not task.done():
+            abort = self._speak_abort_reason(session, run.started_at)
+            if abort is None and loop.time() > deadline:
+                abort = "the audio was not ready in time"
+            if abort is not None:
+                task.cancel()
+                result["reason"] = abort
+                _LOGGER.warning("Speak: %s", abort)
+                return None
+            self._touch()
+            await asyncio.wait({task}, timeout=0.1)
+        frames = await self._speak_resolve_audio(task, result)
+        if frames:
+            result["audio_ready_after"] = round(loop.time() - run.started_at, 1)
+            _LOGGER.debug(
+                "Speak: audio ready %.1f s after the answer", result["audio_ready_after"]
+            )
+        return frames
+
+    async def _speak_on_call(
+        self,
+        run: _SpeakRun,
+        frames: list[bytes] | None,
+        audio: Awaitable[list[bytes]] | None,
+        door: dict[str, Any] | None,
+        audio_wait: float,
+        lead_in: float,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The call is answered: play (once the audio is ready), then open."""
+        if not frames and audio is not None:
+            frames = await self._speak_await_audio(run, audio, result)
+        if frames:
+            await self._speak_play(run, frames, audio_wait, lead_in, result)
+        if door is not None:
+            if frames is None and audio is None:
+                # Door only (e.g. at night): let the answer settle, as the
+                # coordinator's in-call open does.
+                await asyncio.sleep(_DOOR_AFTER_ANSWER)
+            await self._speak_open_door(run, door, result)
+            if not frames and not result["reason"]:
+                result["reason"] = result["door_reason"]
+        return result
+
+    async def _speak_open_door(
+        self, run: _SpeakRun, door: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        """open_door: send 0x1840/0x000D on the speak call and wait for the ACK."""
+        session = run.session
+        door_addr = str(door.get("apt-address") or "")
+        # A new ring during the message (often the same visitor pressing again)
+        # no longer prevents the open: the message was cut and the door opens
+        # at once inside this call, which is still ours (E4).
+        new_ring = self._last_ring_at > run.started_at
+        if session is None or self._session is not session or not session.active:
+            result["door_reason"] = "the call dropped: door not opened"
+        elif not _same_address(door_addr, self._entrance or ""):
+            result["door_reason"] = "the door belongs to another entrance"
+        else:
+            our_addr, apt_addr = self._door_addresses()
+            try:
+                ack, _flags = await session.open_door_in_call(
+                    our_addr, door_addr, _relay_of(door), apt_addr
+                )
+            except Exception as err:  # noqa: BLE001
+                result["door_reason"] = (
+                    f"in-call open failed: {str(err) or type(err).__name__}"
+                )
+            else:
+                result["door_opened"] = True
+                result["door_ack"] = ack
+                await self._wait_door_confirmed(session)
+                result["door_confirmed"] = session.door_confirmed
+                result["door_reason"] = (
+                    "confirmed" if session.door_confirmed
+                    else "ok" if ack else "no ACK from the panel"
+                )
+                if new_ring:
+                    result["door_reason"] += " (opened at once: a new ring arrived)"
+        level = logging.INFO if result["door_opened"] else logging.WARNING
+        _LOGGER.log(level, "Speak: door %s: %s", door.get("name"), result["door_reason"])
 
     async def _speak_answer(
         self, entrance: str, transport: str, run: _SpeakRun, result: dict[str, Any]
@@ -774,7 +1066,7 @@ class ComelitStreamManager:
         audio_wait: float,
         lead_in: float,
         result: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> bool:
         """Wait for the audio path, play the frames, report (both modes)."""
         loop = self.hass.loop
         session = run.session
@@ -790,7 +1082,7 @@ class ComelitStreamManager:
             if abort is not None:
                 result["reason"] = abort
                 _LOGGER.warning("Speak: %s", abort)
-                return result
+                return False
             if rx is not None and rx.audio_packet_count > 0:
                 result["rx_audio"] = True
                 break
@@ -819,7 +1111,7 @@ class ComelitStreamManager:
                 result["reason"] = abort
                 result["frames_sent"] = session.talk_frames_sent[1]
                 _LOGGER.warning("Speak: %s", abort)
-                return result
+                return False
             self._touch()
             await asyncio.sleep(0.1)
         await asyncio.sleep(_SPEAK_TAIL)
@@ -837,7 +1129,7 @@ class ComelitStreamManager:
             result["transport"],
             "yes" if result["rx_audio"] else "no",
         )
-        return result
+        return True
 
     async def _speak_cleanup(self, run: _SpeakRun, result: dict[str, Any]) -> None:
         """Hang up and hand CTPP back, whatever happened (even if cancelled)."""

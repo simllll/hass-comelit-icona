@@ -782,7 +782,12 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         async with self._ctpp_lock:
             events = self.events_manager
-            if events is not None:
+            # Pause the listener unless a call already did, and hand it back
+            # only when no call holds CTPP (one being set up counts): a resume
+            # while a call (e.g. the ring preview) holds CTPP would let the
+            # listener steal that call's frames (seen on 26/10). A listener
+            # left paused with no call at all is put back to listen, as before.
+            if events is not None and not events.paused_for_video:
                 with contextlib.suppress(Exception):
                     await events.async_pause_local()
             try:
@@ -795,7 +800,11 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Peer/TAP door '%s' opened via shared CTPP", door.get("name")
                 )
             finally:
-                if events is not None:
+                if (
+                    events is not None
+                    and events.paused_for_video
+                    and not self.stream.holds_ctpp
+                ):
                     with contextlib.suppress(Exception):
                         await events.async_resume_local()
 
@@ -806,6 +815,41 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         door = next((d for d in doors if d.get("name") == door_name), None)
         if not door:
             raise Exception(f"Door '{door_name}' not found")
+
+        # A call with this door's entrance is up (ring preview, answered call,
+        # live view, speak): open inside it with 0x1840/0x000D, as the app
+        # does. On 26/10 the TAP open sent during a ring was ignored by the
+        # panel. Fall back to the idle paths only if nothing was sent.
+        if self._shared_client and self._shared_client.connected:
+            try:
+                res = await self.stream.async_open_door_in_call(door)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("In-call open of '%s' failed: %s", door_name, err)
+                res = None
+            if res is not None:
+                # A ring's call (preview or answered): no TAP after a sent
+                # command, it did not open during a ring and could open twice.
+                # An outbound call (live view, snapshot, speak "call") with
+                # neither ACK nor confirmation: the TAP this button did before.
+                if res["sent"] and (res["ack"] or res["confirmed"] or res["inbound"]):
+                    _LOGGER.info(
+                        "Door '%s' opened inside the call (%s%s)",
+                        door_name,
+                        res["reason"],
+                        ", answered the ring first" if res["answered"] else "",
+                    )
+                    return
+                if res["sent"]:
+                    _LOGGER.warning(
+                        "Door '%s': no ACK inside the outbound call; using the TAP",
+                        door_name,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Door '%s': in-call open not sent (%s); using the idle path",
+                        door_name,
+                        res["reason"],
+                    )
 
         # Peer/TAP doors (1456S/6741W): prefer the shared held CTPP so we don't
         # open a second, short-lived CTPP registration (issue #64). Fall back to

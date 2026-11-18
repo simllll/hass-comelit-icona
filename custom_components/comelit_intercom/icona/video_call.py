@@ -62,6 +62,14 @@ _TALK_SILENCE = bytes([0xD5]) * 160  # A-law code of linear 0
 _TALK_MAX_LAG = 0.2
 # Consecutive send failures (~0.5 s) after which the talk sender gives up.
 _TALK_MAX_ERRORS = 25
+# In-call door open (0x1840/0x000D): how long to wait for the panel's ACK.
+_DOOR_ACK_TIMEOUT = 2.0
+# A CALL_END 0x1840/0x0003 sub 0x000E this soon after our door command is the
+# panel ending the call because the relay fired (PCAP of the app's live view).
+_DOOR_CONFIRM_WINDOW = 5.0
+# Call-end frame queued while answering a preview: look this long at the video
+# to tell a call that is really over from a door frame alone (26/10).
+_ENDED_VIDEO_CHECK = 0.3
 
 
 class VideoCallSession:
@@ -157,6 +165,21 @@ class VideoCallSession:
         self._inbound_ctx: dict | None = None
         # Flags of a call-end frame found while answering (the call is over).
         self.call_already_ended: int | None = None
+        # One answer at a time (speak and an in-call door open may race), and
+        # end the call on the device's CALL_END once HA answered it that way.
+        self._accept_lock = asyncio.Lock()
+        self._end_on_call_end = False
+        # In-call door open: one at a time; the pending ACK and what the panel
+        # said about the door (0x1860/0x0003 flags) while it was pending.
+        self._door_lock = asyncio.Lock()
+        self._door_ack: asyncio.Future | None = None
+        self._door_addr = ""
+        self._door_event_flags: int | None = None
+        # The relay really fired: the panel ended the call with CALL_END sub
+        # 0x000E right after our 0x000D (the ACK alone proves nothing: on
+        # 26/10 a TAP that did not open got one too).
+        self.door_confirmed = False
+        self._door_sent_at = 0.0
 
     @property
     def active(self) -> bool:
@@ -713,9 +736,17 @@ class VideoCallSession:
                         _LOGGER.debug("Talk: device sent its own 0x%04X peer (0x70)", msg_type)
                     self._device_talk_ack = True
                 if msg_type == 0x1840:
-                    if action == 0x0003 and self._inbound and self._talk:
-                        # Answered incoming call (speak "answer"): CALL_END ends
-                        # it. Never re-establish as an outbound call here.
+                    if (
+                        action == 0x0003
+                        and sub == 0x000E
+                        and self._door_sent_at
+                        and time.monotonic() - self._door_sent_at < _DOOR_CONFIRM_WINDOW
+                    ):
+                        self.door_confirmed = True  # CALL_END caused by the relay
+                    if action == 0x0003 and self._end_on_call_end:
+                        # Incoming call answered by speak or by an in-call door
+                        # open, or a speak call that opened the door: CALL_END
+                        # ends it. Never re-establish as an outbound call here.
                         async with self._ctpp_lock:
                             call_counter += _CTR_INCR_BYTE5
                             self._call_counter = call_counter
@@ -773,6 +804,8 @@ class VideoCallSession:
                     # Device 0x1860 messages during an active session (e.g.
                     # 0x000A RTPC link that _ack_device_rtpc_link missed, or
                     # other device-initiated messages) — bare ACK.
+                    if action == 0x0003 and self._door_ack is not None:
+                        self._door_event_flags = sub  # door FSM after our open
                     async with self._ctpp_lock:
                         call_counter += _CTR_INCR_BYTE4
                         self._call_counter = call_counter
@@ -785,7 +818,9 @@ class VideoCallSession:
                             call_counter,
                         )
                 elif msg_type == 0x1800:
-                    pass  # device ACK — no response needed
+                    # Device ACK: no response needed. While an in-call door
+                    # open waits, the ACK sent by the door's unit settles it.
+                    self._note_door_ack(resp)
                 elif is_verbose_logging():
                     _LOGGER.debug(
                         "CTPP monitor: unexpected type=0x%04X (%d bytes)",
@@ -1168,6 +1203,10 @@ class VideoCallSession:
         """
         client = self._client
         self._inbound = True
+        # The panel retransmits the ring (~7.5 s): once this call forwards
+        # rings, those copies must not count as a new ring (they would cut a
+        # message speak plays on it).
+        self._last_ring_fired[entrance_addr] = time.monotonic()
         try:
             apt_addr = self._config.apt_address
             apt_sub = self._config.apt_subaddress
@@ -1486,14 +1525,30 @@ class VideoCallSession:
         # On an answered inbound call the only TX verified so far is UDP (the
         # inbound audio sender, 6701W), so "auto" means UDP here.
         self._talk_transport_pref = "udp" if transport == "auto" else transport
-        if not self._inbound_accepted:
-            if not await self._accept_preview(client):
-                return False
-        elif self._rtp_receiver is not None:
+        if not await self.accept_inbound():
+            return False
+        if self._rtp_receiver is not None:
             self._rtp_receiver.stop_audio_sender()  # ours replaces it
         self._answer_sent.set()
         self._start_talk_sender(client)
         return self.talk_running
+
+    async def accept_inbound(self) -> bool:
+        """Answer the incoming call this session holds (idempotent).
+
+        A preview (the on-ring snapshot call) is accepted with steps 13-18 of
+        start_inbound; an already accepted call (auto-answer, or a previous
+        accept) needs nothing. Speak and an in-call door open may both ask:
+        the lock makes the second one wait and find it accepted. Afterwards
+        the device's CALL_END ends the call (no outbound re-establishment).
+        """
+        async with self._accept_lock:
+            if not self._inbound or not self._active:
+                return False
+            if not self._inbound_accepted and not await self._accept_preview(self._client):
+                return False
+            self._end_on_call_end = True
+            return True
 
     async def _accept_preview(self, client: IconaBridgeClient) -> bool:
         """Accept an inbound call held in preview: start_inbound steps 13-18.
@@ -1519,15 +1574,33 @@ class VideoCallSession:
             backlog.append(ctpp.response_queue.get_nowait())
         for data in backlog:
             ctpp.response_queue.put_nowait(data)
-        for data in backlog:
-            if (
-                len(data) >= 10
+        end_flags = next(
+            (
+                struct.unpack_from(">H", data, 8)[0]
+                for data in backlog
+                if len(data) >= 10
                 and struct.unpack_from("<H", data, 0)[0] in (0x1840, 0x1860)
                 and struct.unpack_from(">H", data, 6)[0] == 0x0003
-            ):
-                self.call_already_ended = struct.unpack_from(">H", data, 8)[0]
+            ),
+            None,
+        )
+        if end_flags is not None:
+            # A door frame alone is no proof: on 26/10 the panel sent one after
+            # each (failed) TAP open while the ring went on. The call is over
+            # only if the panel also stopped streaming to the preview (on 23/10
+            # the video stopped 150 ms before the call-end frame).
+            rx = self._rtp_receiver
+            seen = (rx.tcp_media_packet_count + rx.udp_media_packet_count) if rx else 0
+            await asyncio.sleep(_ENDED_VIDEO_CHECK)
+            now = (rx.tcp_media_packet_count + rx.udp_media_packet_count) if rx else 0
+            if now == seen:
+                self.call_already_ended = end_flags
                 _LOGGER.info("Talk: the incoming call already ended, not answering it")
                 return False
+            _LOGGER.info(
+                "Talk: call-end frame 0x%04X queued but the video still flows: answering",
+                end_flags,
+            )
 
         # Steps 13-14: PEER (inbound format) + call_accepted, each +B4.
         async with self._ctpp_lock:
@@ -1661,6 +1734,60 @@ class VideoCallSession:
                 relay_index,
                 self._call_counter,
             )
+
+    async def open_door_in_call(
+        self,
+        our_addr: str,
+        door_addr: str,
+        relay_index: int,
+        apt_addr: str,
+        ack_timeout: float = _DOOR_ACK_TIMEOUT,
+    ) -> tuple[bool, int | None]:
+        """Open a door inside this call and wait for the panel's ACK.
+
+        Sends 0x1840/0x000D (async_open_door_on_ctpp) and waits for the 0x1800
+        ACK sent by the door's unit (the panel ACKs from its own address,
+        e.g. SB100001). Returns (acked, flags of a 0x1860/0x0003 door frame
+        seen meanwhile, or None). Neither proves that the relay tripped: on
+        26/10 the panel answered a TAP open during a ring with 0x1860/0x0003
+        and the lock stayed shut.
+        """
+        async with self._door_lock:
+            loop = asyncio.get_running_loop()
+            self._door_ack = loop.create_future()
+            self._door_addr = door_addr
+            self._door_event_flags = None
+            self.door_confirmed = False
+            if self._talk:
+                # A speak call ends with the door: the panel's CALL_END after
+                # the relay closes it instead of a renewal.
+                self._end_on_call_end = True
+            try:
+                await self.async_open_door_on_ctpp(
+                    our_addr, door_addr, relay_index, apt_addr=apt_addr
+                )
+                self._door_sent_at = time.monotonic()
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._door_ack), ack_timeout)
+                    acked = True
+                except TimeoutError:
+                    acked = False
+                return acked, self._door_event_flags
+            finally:
+                self._door_ack = None
+
+    def _note_door_ack(self, resp: bytes) -> None:
+        """Settle a pending in-call door open on an ACK from the door's unit."""
+        waiter = self._door_ack
+        if waiter is None or waiter.done():
+            return
+        parsed = parse_ctpp_message(resp) or {}
+        addresses = parsed.get("addresses") or [""]
+        sender = (addresses[0] or "").upper()
+        door = self._door_addr.upper()
+        # Kit-mode frames may drop the "S" prefix (B100001 vs SB100001).
+        if sender and door and (sender.endswith(door) or door.endswith(sender)):
+            waiter.set_result(True)
 
     async def _auto_timeout_loop(self) -> None:
         """Automatically stop the session after VIDEO_SESSION_TIMEOUT."""

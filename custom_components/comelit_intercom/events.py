@@ -99,6 +99,11 @@ class ComelitEventsManager:
     def source(self) -> str:
         return self._source
 
+    @property
+    def paused_for_video(self) -> bool:
+        """True while a call has borrowed the CTPP channel (listener paused)."""
+        return self._paused_for_video
+
     # --- lifecycle -------------------------------------------------------
     async def async_start(self) -> None:
         """Create the FCM fallback and start the source-selection monitor.

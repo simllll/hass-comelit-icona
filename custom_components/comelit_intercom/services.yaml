@@ -96,9 +96,11 @@ speak:
     audio and hangs up; it never interrupts a ring, a call or a live view: it
     waits up to "Max wait" for the panel to be free, otherwise it gives up and
     logs why. Mode "answer" answers the incoming call Home Assistant holds
-    after a ring and speaks on it (the monitor may then lose that call).
-    Experimental. Never opens a door. Returns the outcome (spoken, reason,
-    timings).
+    after a ring at once and speaks on it as soon as the audio is ready (the
+    monitor may then lose that call). With "Open the door" it opens the door
+    inside the same call afterwards; it never opens otherwise. "Prepare only"
+    builds and caches the audio without any call. Experimental. Returns the
+    outcome (spoken, door, reason, timings).
   target:
     entity:
       integration: comelit_intercom
@@ -124,9 +126,36 @@ speak:
       default: true
       selector:
         boolean:
+    open_door:
+      name: Open the door
+      description: >-
+        After the message (or right after answering, with no message), open
+        the door inside the same call and wait for the panel's ACK. Off by
+        default: without it the door is never opened.
+      default: false
+      selector:
+        boolean:
+    door:
+      name: Door
+      description: >-
+        Name of the door to open (as in the device's opendoor address book).
+        Default: the only door on this entrance.
+      example: "Serratura ingresso"
+      selector:
+        text:
+    prepare_only:
+      name: Prepare only
+      description: >-
+        Only build the audio and keep it in memory (no call), so a later
+        speak with the same message starts at once. For warm-up automations.
+      default: false
+      selector:
+        boolean:
     message:
       name: Message
-      description: Text to say. Give this or a media content ID.
+      description: >-
+        Text to say. Give this or a media content ID (or neither, with "Open
+        the door").
       example: "Buongiorno, bentornata a casa!"
       selector:
         text:
