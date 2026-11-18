@@ -62,7 +62,9 @@ _TALK_SILENCE = bytes([0xD5]) * 160  # A-law code of linear 0
 _TALK_MAX_LAG = 0.2
 # Consecutive send failures (~0.5 s) after which the talk sender gives up.
 _TALK_MAX_ERRORS = 25
-# In-call door open (0x1840/0x000D): how long to wait for the panel's ACK.
+# In-call door open (0x1840/0x000D): how long to wait for the panel's ACK by
+# default. The 6741W sends none and opens anyway (door test 26/10); the
+# stream manager passes its own budget.
 _DOOR_ACK_TIMEOUT = 2.0
 # A CALL_END 0x1840/0x0003 sub 0x000E this soon after our door command is the
 # panel ending the call because the relay fired (PCAP of the app's live view).
@@ -149,6 +151,8 @@ class VideoCallSession:
         self._talk = talk
         self._talk_transport_pref = talk_transport  # "auto" | "tcp" | "udp"
         self._talk_transport: str | None = None
+        self._talk_transport_auto = False  # chosen by "auto" (the media's way)
+        self._media_transport: str | None = None  # how the media came, then
         self._answer_sent = asyncio.Event()
         self._device_rtpc: Channel | None = None
         self._talk_task: asyncio.Task | None = None
@@ -177,7 +181,9 @@ class VideoCallSession:
         self._door_event_flags: int | None = None
         # The relay really fired: the panel ended the call with CALL_END sub
         # 0x000E right after our 0x000D (the ACK alone proves nothing: on
-        # 26/10 a TAP that did not open got one too).
+        # 26/10 a TAP that did not open got one too). App PCAP (6701W); the
+        # 6741W sends neither the ACK nor this CALL_END after an in-call open,
+        # and its lock trips anyway (door test 26/10).
         self.door_confirmed = False
         self._door_sent_at = 0.0
 
@@ -1061,6 +1067,16 @@ class VideoCallSession:
         return self._talk_transport
 
     @property
+    def talk_transport_auto(self) -> bool:
+        """True when "auto" chose the talk transport (the way the media came)."""
+        return self._talk_transport_auto
+
+    @property
+    def media_transport(self) -> str | None:
+        """How the call's media reached us ("tcp"/"udp") when the sender started."""
+        return self._media_transport
+
+    @property
     def talk_running(self) -> bool:
         """True while the talk sender is streaming to the device."""
         return self._talk_task is not None and not self._talk_task.done()
@@ -1100,18 +1116,32 @@ class VideoCallSession:
             if self._device_rtpc is None:
                 _LOGGER.warning("Talk: no device RTPC channel, cannot send audio")
             return
+        rx = self._rtp_receiver
+        tcp = rx.tcp_media_packet_count if rx else 0
+        udp = rx.udp_media_packet_count if rx else 0
+        self._media_transport = "tcp" if tcp and tcp >= udp else "udp" if udp else None
         transport = self._talk_transport_pref
-        if transport not in ("tcp", "udp"):
-            # Mirror the device: send the way its media reaches us.
-            rx = self._rtp_receiver
-            tcp = rx.tcp_media_packet_count if rx else 0
-            udp = rx.udp_media_packet_count if rx else 0
-            transport = "tcp" if tcp >= udp else "udp"
+        self._talk_transport_auto = transport not in ("tcp", "udp")
+        if self._talk_transport_auto:
+            # Mirror the device, on outbound and answered incoming calls
+            # alike: send the way its media reach us (TCP when none seen yet).
+            # A 6741W sends an answered ring's media over TCP and plays only
+            # TCP audio (door test 26/10: over UDP the speaker opened, silent).
+            transport = self._media_transport or "tcp"
         self._talk_transport = transport
         self._talk_task = asyncio.create_task(self._talk_send_loop(client, transport))
-        _LOGGER.debug(
-            "Talk: TX audio started over %s to device RTPC 0x%04X",
+        if not self._talk_transport_auto:
+            why = "requested"
+        elif self._media_transport is None:
+            why = "auto, no media seen yet"
+        else:
+            why = f"auto, as the call's media ({self._media_transport.upper()})"
+        _LOGGER.info(
+            "Talk: TX audio over %s (%s; media packets tcp %d, udp %d) to device RTPC 0x%04X",
             transport.upper(),
+            why,
+            tcp,
+            udp,
             self._device_rtpc.server_channel_id,
         )
 
@@ -1522,9 +1552,10 @@ class VideoCallSession:
             return False
         client = self._client
         self._talk = True
-        # On an answered inbound call the only TX verified so far is UDP (the
-        # inbound audio sender, 6701W), so "auto" means UDP here.
-        self._talk_transport_pref = "udp" if transport == "auto" else transport
+        # "auto" mirrors the call's media, as on outbound talk calls: on a
+        # 6741W an answered ring's media arrive over TCP and only TCP audio
+        # is played (door test 26/10; over UDP the speaker opened, silent).
+        self._talk_transport_pref = transport
         if not await self.accept_inbound():
             return False
         if self._rtp_receiver is not None:
@@ -1750,7 +1781,9 @@ class VideoCallSession:
         e.g. SB100001). Returns (acked, flags of a 0x1860/0x0003 door frame
         seen meanwhile, or None). Neither proves that the relay tripped: on
         26/10 the panel answered a TAP open during a ring with 0x1860/0x0003
-        and the lock stayed shut.
+        and the lock stayed shut. Nor does their absence prove the opposite:
+        the 6741W sends no ACK (and no CALL_END) for an in-call open, and
+        its lock trips (door test 26/10).
         """
         async with self._door_lock:
             loop = asyncio.get_running_loop()

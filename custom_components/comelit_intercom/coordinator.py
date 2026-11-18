@@ -816,10 +816,12 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not door:
             raise Exception(f"Door '{door_name}' not found")
 
-        # A call with this door's entrance is up (ring preview, answered call,
-        # live view, speak): open inside it with 0x1840/0x000D, as the app
-        # does. On 26/10 the TAP open sent during a ring was ignored by the
-        # panel. Fall back to the idle paths only if nothing was sent.
+        # A ring's call HA holds with this door's entrance (the preview, or a
+        # call answered by speak or auto-answer): open inside it with
+        # 0x1840/0x000D; on 26/10 the panel ignored the TAP sent during a
+        # ring. Any other case, outgoing calls included (live view, snapshot,
+        # speak "call"): the usual TAP below, as before 26/10. One door
+        # command per request, never both.
         if self._shared_client and self._shared_client.connected:
             try:
                 res = await self.stream.async_open_door_in_call(door)
@@ -827,29 +829,19 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("In-call open of '%s' failed: %s", door_name, err)
                 res = None
             if res is not None:
-                # A ring's call (preview or answered): no TAP after a sent
-                # command, it did not open during a ring and could open twice.
-                # An outbound call (live view, snapshot, speak "call") with
-                # neither ACK nor confirmation: the TAP this button did before.
-                if res["sent"] and (res["ack"] or res["confirmed"] or res["inbound"]):
+                if res["sent"]:
                     _LOGGER.info(
-                        "Door '%s' opened inside the call (%s%s)",
+                        "Door '%s' opened inside the ring's call (%s%s)",
                         door_name,
                         res["reason"],
                         ", answered the ring first" if res["answered"] else "",
                     )
                     return
-                if res["sent"]:
-                    _LOGGER.warning(
-                        "Door '%s': no ACK inside the outbound call; using the TAP",
-                        door_name,
-                    )
-                else:
-                    _LOGGER.warning(
-                        "Door '%s': in-call open not sent (%s); using the idle path",
-                        door_name,
-                        res["reason"],
-                    )
+                _LOGGER.warning(
+                    "Door '%s': in-call open not sent (%s); using the idle path",
+                    door_name,
+                    res["reason"],
+                )
 
         # Peer/TAP doors (1456S/6741W): prefer the shared held CTPP so we don't
         # open a second, short-lived CTPP registration (issue #64). Fall back to

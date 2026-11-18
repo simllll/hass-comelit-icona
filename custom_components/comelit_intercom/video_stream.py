@@ -88,12 +88,16 @@ _SPEAK_AUDIO_TIMEOUT = 35.0
 # --- door open inside the call (0x1840/0x000D) ---------------------------
 # After answering a ring only to open the door, let the answer settle.
 _DOOR_AFTER_ANSWER = 0.5
-# After the door command, wait this long for the panel's own CALL_END sub
-# 0x000E (the relay fired: the real confirmation, PCAP of the app) before
-# hanging up locally. The panel retransmits an unacknowledged frame at about
-# +0.45, +1.45 and +3.4 s (log of 23/10): 4 s covers the first three copies
-# and keeps a dashboard button press short.
-_DOOR_CONFIRM_TIMEOUT = 4.0
+# After the door command, wait at most this long in all for the panel's ACK
+# and its CALL_END sub 0x000E (the relay fired: app PCAP, 6701W), then go on
+# and hang up a call answered only for this. A panel that replies does so at
+# once and resends an unacknowledged frame after 0.45-1 s (logs of 23/10 and
+# 26/10), so 2 s still catch a first resent copy. The 6741W sends neither
+# after an in-call open and its lock trips anyway (door test 26/10: gate open
+# within 2-3 s): there the wait is idle, and the former 6 s (2 s ACK + 4 s
+# confirmation) only delayed the hang-up. The hang-up is local (no frame is
+# sent to the panel), so it cannot cut the relay.
+_DOOR_WAIT = 2.0
 # Bound on answering a ring preview before an in-call door open.
 _DOOR_ANSWER_TIMEOUT = 20.0
 
@@ -114,7 +118,9 @@ def speak_result(
         "duration": duration,
         "rx_audio": False,
         "device_ack": False,
-        "transport": None,
+        "transport": None,  # TX audio transport used: "tcp" / "udp"
+        "transport_auto": False,  # chosen by "auto": the way the call's media came
+        "media_transport": None,  # how the call's media reached HA: "tcp" / "udp"
         "frames_sent": 0,
         "audio_ready_after": None,  # answer mode: seconds from answer to audio
         "cached": False,  # frames from the in-memory cache (set by speak.py)
@@ -136,6 +142,22 @@ class _SpeakRun:
     starting: bool = False  # a talk call start paused the listener
     retry: bool = False  # the last attempt may be retried
     inbound: bool = False  # run.session is an answered incoming call
+
+
+def _note_transport(session: VideoCallSession, result: dict[str, Any]) -> None:
+    """Copy the talk transport, and why it was chosen, into the result."""
+    result["transport"] = session.talk_transport
+    result["transport_auto"] = bool(getattr(session, "talk_transport_auto", False))
+    result["media_transport"] = getattr(session, "media_transport", None)
+
+
+def _transport_text(result: dict[str, Any]) -> str:
+    """The transport for the logs, e.g. "tcp (auto: media over tcp)"."""
+    transport = result["transport"] or "?"
+    if not result["transport_auto"]:
+        return f"{transport} (requested)"
+    media = result["media_transport"]
+    return f"{transport} (auto: media over {media})" if media else f"{transport} (auto: no media seen)"
 
 
 def _relay_of(door: dict[str, Any]) -> int:
@@ -594,17 +616,24 @@ class ComelitStreamManager:
         return f"{apt}{vip.get('apt-subaddress', 0)}", apt
 
     async def async_open_door_in_call(self, door: dict[str, Any]) -> dict[str, Any] | None:
-        """Open *door* inside the call HA holds with the door's entrance.
+        """Open *door* inside the ring's call HA holds with the door's entrance.
 
-        None: there is no such call (the caller uses the idle TAP path).
-        Otherwise a dict: sent, ack, answered (HA answered the ring preview
-        to open), ended (the ring's call was already over: the preview is
-        hung up and the caller may fall back), event_flags, reason.
+        None: HA holds no ring's call with that entrance (no call, another
+        entrance, or an outgoing call: live view, snapshot, speak "call").
+        The caller then sends the usual TAP, as before 26/10: one door
+        command per request, never both. Otherwise a dict: sent, ack,
+        confirmed (CALL_END 0x000E), inbound, answered (HA answered the ring
+        preview to open), ended (the ring's call was already over: the
+        preview is hung up and the caller may use the TAP), event_flags,
+        reason. ACK and confirmation are awaited for at most _DOOR_WAIT in
+        all; the 6741W sends neither.
 
-        A ring preview is answered first, with the same frames as speak's
-        answer: on 26/10 the panel ignored a TAP open sent during the ring,
-        and 0x1840/0x000D is only verified inside a call HA has answered
-        (outbound live view, app PCAP). A call answered only for this is
+        Only rings' calls: there the panel ignored the TAP (26/10). A preview
+        is answered first, with the same frames as speak's answer, since
+        0x1840/0x000D is verified only inside a call HA has answered. In
+        outgoing calls the app uses it too (PCAP, 6701W), but the 6741W never
+        ACKs it, so without an ACK HA could not tell whether a TAP is still
+        needed: the TAP alone is used there. A call answered only for this is
         closed afterwards, unless speak or a viewer uses it.
         """
         door_addr = str(door.get("apt-address") or "")
@@ -625,11 +654,12 @@ class ComelitStreamManager:
             if (
                 session is None
                 or not session.active
+                or not session.inbound
                 or not _same_address(door_addr, self._entrance or "")
             ):
                 return None
-            out["inbound"] = session.inbound
-            if session.inbound and not session.inbound_accepted:
+            out["inbound"] = True
+            if not session.inbound_accepted:
                 try:
                     ok = await asyncio.wait_for(
                         session.accept_inbound(), timeout=_DOOR_ANSWER_TIMEOUT
@@ -654,9 +684,10 @@ class ComelitStreamManager:
                     # mic), as after the Answer doorbell button.
                     session.answer_inbound()
                 await asyncio.sleep(_DOOR_AFTER_ANSWER)
+            sent_at = self.hass.loop.time()
             try:
                 ack, flags = await session.open_door_in_call(
-                    our_addr, door_addr, relay, apt_addr
+                    our_addr, door_addr, relay, apt_addr, ack_timeout=_DOOR_WAIT
                 )
             except Exception as err:  # noqa: BLE001
                 out["reason"] = f"in-call open failed: {str(err) or type(err).__name__}"
@@ -664,12 +695,12 @@ class ComelitStreamManager:
             server = self._server
             viewers = server is not None and server.client_count > 0
             closing = out["answered"] and not self._speak_owns_session() and not viewers
-            if closing or (not session.inbound and not ack):
-                # Wait for the real confirmation: the panel ends the call
-                # (CALL_END 0x000E) when the relay fires. Before hanging up a
-                # call answered only for this; on an outbound call without ACK
-                # it decides the TAP fallback (E1).
-                await self._wait_door_confirmed(session)
+            if closing:
+                # Before hanging up a call answered only for this, the rest of
+                # _DOOR_WAIT for the panel's CALL_END 0x000E (relay fired),
+                # which ends the call cleanly. Without an ACK the budget is
+                # already spent (a confirmation seen meanwhile counts).
+                await self._wait_door_confirmed(session, sent_at + _DOOR_WAIT)
             confirmed = session.door_confirmed
             out.update(
                 sent=True,
@@ -683,9 +714,8 @@ class ComelitStreamManager:
                 self._cancel_idle_monitor()
             return out
 
-    async def _wait_door_confirmed(self, session: VideoCallSession) -> None:
-        """Up to _DOOR_CONFIRM_TIMEOUT for the panel's CALL_END after the door."""
-        deadline = self.hass.loop.time() + _DOOR_CONFIRM_TIMEOUT
+    async def _wait_door_confirmed(self, session: VideoCallSession, deadline: float) -> None:
+        """Until *deadline* (loop time) for the panel's CALL_END after the door."""
         while (
             session.active
             and not session.door_confirmed
@@ -718,8 +748,10 @@ class ComelitStreamManager:
         the audio is ready (silence meanwhile); with no such call, fall back
         to "call" when *answer_fallback*, else give up.
         *door* (an opendoor-address-book entry): after the audio, or right
-        after the answer when there is none, open it inside the same call
-        (0x1840/0x000D) and wait for the panel's ACK; never otherwise.
+        after the answer when there is none, open it: inside the answered
+        ring's call (0x1840/0x000D, "answer" mode), or with the usual TAP
+        during an outgoing call ("call" mode), as lock.open does; never
+        otherwise.
 
         After the answer, silence is streamed and, up to *audio_wait*, the
         panel's own audio is awaited as proof the audio path is open; then
@@ -855,22 +887,40 @@ class ComelitStreamManager:
     async def _speak_open_door(
         self, run: _SpeakRun, door: dict[str, Any], result: dict[str, Any]
     ) -> None:
-        """open_door: send 0x1840/0x000D on the speak call and wait for the ACK."""
+        """open_door: 0x1840/0x000D on an answered ring's call, else the TAP."""
         session = run.session
         door_addr = str(door.get("apt-address") or "")
-        # A new ring during the message (often the same visitor pressing again)
-        # no longer prevents the open: the message was cut and the door opens
-        # at once inside this call, which is still ours (E4).
+        # On a ring's call a new ring during the message (often the same
+        # visitor pressing again) no longer prevents the open: the message
+        # was cut and the door opens at once inside this call, still ours (E4).
         new_ring = self._last_ring_at > run.started_at
         if session is None or self._session is not session or not session.active:
             result["door_reason"] = "the call dropped: door not opened"
         elif not _same_address(door_addr, self._entrance or ""):
             result["door_reason"] = "the door belongs to another entrance"
+        elif not run.inbound:
+            # An outgoing speak call ("call" mode): the usual TAP, sent during
+            # the call through the coordinator, as lock.open does with any
+            # outgoing call; 0x1840/0x000D only on rings' calls. Not while a
+            # new ring is up: on 26/10 the panel ignored the TAP during a ring.
+            if new_ring:
+                result["door_reason"] = "a new ring arrived: door not opened (outgoing call)"
+            else:
+                try:
+                    await self._coordinator.async_open_door(str(door.get("name") or ""))
+                except Exception as err:  # noqa: BLE001
+                    result["door_reason"] = (
+                        f"door open failed: {str(err) or type(err).__name__}"
+                    )
+                else:
+                    result["door_opened"] = True
+                    result["door_reason"] = "opened with the TAP (outgoing call)"
         else:
             our_addr, apt_addr = self._door_addresses()
+            sent_at = self.hass.loop.time()
             try:
                 ack, _flags = await session.open_door_in_call(
-                    our_addr, door_addr, _relay_of(door), apt_addr
+                    our_addr, door_addr, _relay_of(door), apt_addr, ack_timeout=_DOOR_WAIT
                 )
             except Exception as err:  # noqa: BLE001
                 result["door_reason"] = (
@@ -879,7 +929,7 @@ class ComelitStreamManager:
             else:
                 result["door_opened"] = True
                 result["door_ack"] = ack
-                await self._wait_door_confirmed(session)
+                await self._wait_door_confirmed(session, sent_at + _DOOR_WAIT)
                 result["door_confirmed"] = session.door_confirmed
                 result["door_reason"] = (
                     "confirmed" if session.door_confirmed
@@ -940,10 +990,11 @@ class ComelitStreamManager:
             return False
         result["answered"] = True
         result["answered_after"] = round(loop.time() - self._last_ring_at, 1)
-        result["transport"] = session.talk_transport
+        _note_transport(session, result)
         _LOGGER.info(
-            "Speak: answered the incoming call %.1f s after the ring",
+            "Speak: answered the incoming call %.1f s after the ring, TX audio over %s",
             result["answered_after"],
+            _transport_text(result),
         )
         return True
 
@@ -1051,7 +1102,7 @@ class ComelitStreamManager:
             abort = "call not answered (no video, or the 0x70 failed)"
             run.retry = True
         if abort is None:
-            result["transport"] = session.talk_transport
+            _note_transport(session, result)
             return True
         result["reason"] = abort
         _LOGGER.warning("Speak: %s", abort)
@@ -1126,7 +1177,7 @@ class ComelitStreamManager:
             self._entrance,
             result["mode"],
             result["waited"],
-            result["transport"],
+            _transport_text(result),
             "yes" if result["rx_audio"] else "no",
         )
         return True

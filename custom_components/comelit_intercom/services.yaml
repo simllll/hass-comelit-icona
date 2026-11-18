@@ -130,8 +130,10 @@ speak:
       name: Open the door
       description: >-
         After the message (or right after answering, with no message), open
-        the door inside the same call and wait for the panel's ACK. Off by
-        default: without it the door is never opened.
+        the door. Mode "answer": inside the answered call, waiting at most 2 s
+        for the panel's ACK and call end, then hang up (a 6741W sends neither
+        and opens anyway). Mode "call": the usual open command, as the lock
+        does. Off by default: without it the door is never opened.
       default: false
       selector:
         boolean:
@@ -203,7 +205,9 @@ speak:
         object:
     cache:
       name: Cache
-      description: Reuse Home Assistant's TTS cache for repeated messages.
+      description: >-
+        Reuse Home Assistant's TTS cache and the audio kept in memory for
+        repeated messages. Off: render the message again.
       default: true
       selector:
         boolean:
@@ -259,9 +263,10 @@ speak:
       advanced: true
       name: Transport
       description: >-
-        Advanced: how to send the audio to the panel. "auto": in mode "call"
-        the same transport as the panel's video (TCP or UDP); in mode
-        "answer" UDP, the path already used on answered incoming calls.
+        Advanced: how to send the audio to the panel. "auto": the same
+        transport as the call's video (TCP or UDP), in both modes. A 6741W
+        plays the voice only over TCP (over UDP its speaker switches on but
+        stays silent); its video arrives over TCP, so "auto" picks TCP.
       default: "auto"
       selector:
         select:
