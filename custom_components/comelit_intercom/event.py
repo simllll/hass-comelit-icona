@@ -118,6 +118,11 @@ class ComelitDoorbellEvent(ComelitEntity, EventEntity):
         """Return True if a ring from *caller* belongs to this doorbell."""
         return bool(caller) and self._matcher(caller)
 
+    @property
+    def available(self) -> bool:
+        """Rings arrive on the shared connection, not through the config read."""
+        return True
+
     async def async_added_to_hass(self) -> None:
         """Subscribe to ring dispatches (and fire the ring that created us)."""
         self.async_on_remove(

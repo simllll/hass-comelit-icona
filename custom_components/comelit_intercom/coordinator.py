@@ -133,49 +133,53 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from Comelit."""
         try:
-            await self.client.connect()
+            # Bound the read: a stale channel after a reset used to block it forever
+            async with asyncio.timeout(30):
+                await self.client.connect()
 
-            # Authenticate
-            auth_code = await self.client.authenticate(self.token)
-            if auth_code != 200:
-                raise ConfigEntryAuthFailed(
-                    f"Authentication failed with code {auth_code}"
-                )
+                # Authenticate
+                auth_code = await self.client.authenticate(self.token)
+                if auth_code != 200:
+                    raise ConfigEntryAuthFailed(
+                        f"Authentication failed with code {auth_code}"
+                    )
 
-            # Fetch device info once (model / firmware / serial).
-            if not self.server_info:
-                try:
-                    info = await self.client.get_server_info()
-                    if info:
-                        self.server_info = info
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("server-info fetch failed: %s", err)
+                # Fetch device info once (model / firmware / serial).
+                if not self.server_info:
+                    try:
+                        info = await self.client.get_server_info()
+                        if info:
+                            self.server_info = info
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("server-info fetch failed: %s", err)
 
-            # Get configuration
-            config = await self.client.get_config("all")
-            if not config or "vip" not in config:
-                raise UpdateFailed("Failed to get configuration from device")
+                # Get configuration
+                config = await self.client.get_config("all")
+                if not config or "vip" not in config:
+                    raise UpdateFailed("Failed to get configuration from device")
 
-            self.vip_config = config["vip"]
-            user_params = self.vip_config.get("user-parameters", {})
-            doors = user_params.get("opendoor-address-book", [])
-            actuators = user_params.get("actuator-address-book", [])
+                self.vip_config = config["vip"]
+                user_params = self.vip_config.get("user-parameters", {})
+                doors = user_params.get("opendoor-address-book", [])
+                actuators = user_params.get("actuator-address-book", [])
 
-            return {
-                "doors": doors,
-                "actuators": actuators,
-                "vip": self.vip_config,
-            }
+                return {
+                    "doors": doors,
+                    "actuators": actuators,
+                    "vip": self.vip_config,
+                }
 
         except ConfigEntryAuthFailed:
             # Re-raise auth errors
             raise
         except Exception as err:
-            _LOGGER.error("Error communicating with Comelit device: %s", err)
-            raise UpdateFailed(f"Error communicating with device: {err}") from err
+            _LOGGER.error("Error communicating with Comelit device: %r", err)
+            raise UpdateFailed(f"Error communicating with device: {err!r}") from err
         finally:
             # Always close the (config-only) connection after update
-            await self.client.shutdown()
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(5):
+                    await self.client.shutdown()
 
     # --- shared connection lifecycle ----------------------------------------
 

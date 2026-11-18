@@ -82,6 +82,8 @@ class IconaBridgeClient:
 
     async def connect(self):
         """Connect to the ICONA Bridge"""
+        # Channels of the previous connection are dead: a read on one would wait forever
+        self.open_channels.clear()
         self.logger.info(f"Connecting to {self.host}:{self.port}")
 
         try:
