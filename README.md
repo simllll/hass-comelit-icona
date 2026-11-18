@@ -123,9 +123,9 @@ recognition: `type: recognition` with `external_id`, `recognized`, `activated`,
 `similarity`, `confidence`, `session_id`, `has_image`, and `type: image` with
 `external_id`, `path`, `changed`. The match is made by the monitor with
 Comelit's cloud. A face is not an identity proof (a photo can fool it): don't
-use these events to open doors or disarm alarms. `activated: true` means the
-monitor itself ran its configured action (lock release is on by default; check
-the monitor's face-recognition actions).
+use these events to open doors or disarm alarms. Don't read `activated` as "the
+door was opened" either: on a 6741W it stays `true` even when no action is
+configured for the face on the monitor.
 
 ## How doorbell events work
 

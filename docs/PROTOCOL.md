@@ -194,14 +194,16 @@ shared connection (HA identity, no app session open):
   ```json
   {"message":"rcg-detected-recognition","message-type":"notification","message-id":1,
    "notification-code":200,"notification-string":"Recognition Detected",
-   "data":{"session-id":"114671927","external-id":"michele","recognized":true,
+   "data":{"session-id":"114671927","external-id":"alice","recognized":true,
            "activated":true,"similarity":"99.8128","confidence":"99.9732",
            "image-url":"<omitted>", ...}}
   ```
   `external-id` is the name given to the face on the monitor/app (lowercase
-  here). `activated: true` matched the monitor's own lock release: several
-  `0x1860/0x0003` (door open) VIP messages followed on CTPP. No
-  `rcg-detected-image` was received in that test.
+  here; anonymised above). In this test `activated: true` came with the
+  monitor's own lock release (several `0x1860/0x0003` VIP messages followed
+  on CTPP), but it is no proof of it: after the lock-release action was
+  removed for every face on the monitor, later recognitions still reported
+  `activated: true`. No `rcg-detected-image` was received in that test.
 
 ## Firmware differences (why no heavy abstraction layer)
 
