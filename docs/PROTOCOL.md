@@ -205,6 +205,137 @@ shared connection (HA identity, no app session open):
   removed for every face on the monitor, later recognitions still reported
   `activated: true`. No `rcg-detected-image` was received in that test.
 
+## 11. Talk-back audio on an outbound call ("speak")
+
+Used by `comelit_intercom.speak`. What is verified and what is only read from
+captures is marked. Door tests on a 6741W (below): the panel plays the audio
+on an answered ring over TCP, and nothing on a call opened from Home Assistant.
+
+1. **Call.** Same outbound sequence as the live view (§9): call init, codec,
+   RTPC link, video config. The device opens **its own RTPC channel**
+   (device-initiated COMMAND); its request id is where our audio goes.
+2. **Answer / talk enable (0x70).** Sent once video flows. The live view uses
+   `[0x1840][ts LE32][inner_len BE16][0x0070][caller\0][01 00][FF FF FF FF][caller\0][entrance\0\0]`.
+   The app's frame has a **4-byte flag** `01 00 00 00` (renewal: prefix
+   `0x1860`, flag `00 00 00 00`), i.e. two more zero bytes, same `inner_len`:
+   read from the app's outbound-call-with-audio captures of a 6742W and a 6741W
+   (upstream PR #44, not merged) and identical to the inbound answer frame of
+   the PCAP2 capture (verified working on the inbound answer). Speak sessions
+   send the app frame; the live view is unchanged.
+3. **TX audio.** RTP v2, PT 8 (G.711 A-law), 160-byte payload every 20 ms, seq
+   +1, timestamp +160, fixed SSRC, addressed to the device's RTPC request id:
+   - over **TCP**: an ICONA frame on the shared connection whose header request
+     id is the device's RTPC (what PR #44 derived from the app capture);
+   - over **UDP**: the same header on the media socket (what the inbound answer
+     uses, verified on a 6701W).
+   `auto` follows the transport of the panel's video. The app streams
+   continuously (silence when idle) and, per the PR #44 analysis of the 6741W
+   capture, that panel only starts sending its own audio (RX, on our RTPC1)
+   after receiving ours, answering with its own 0x70 peer frame. Speak streams
+   silence from the answer on and treats the first RX audio packet as proof
+   that the audio path is open (`rx_audio`, `device_ack` in the response).
+4. **Lease renewal** (~30 s, `0x1840/0x0003` CALL_END → inline
+   re-establishment): the device opens a new RTPC; TX follows the newest one
+   and the renewal `0x1860/0x0070` uses the app frame too.
+5. **Hang-up.** As for the live view and snapshots, the channels are dropped
+   locally; no `0x002D` hang-up frame is sent. Seen on a 6741W: after the
+   integration released the on-ring preview, the panel kept streaming video to
+   it for ~6 s, until its own call ended.
+
+**When is the panel free?** Timeline of a recognised face (6741W, firmware
+2.1.0, live log):
+
+| time | event |
+|------|-------|
+| 16:38:24 | ring `0x18C0/0x0028`; the integration runs the inbound preview (snapshot) |
+| 16:38:30 | FRCG `rcg-detected-recognition`, `activated: true` |
+| 16:38:34 | preview released; the six `0x1800/0x0000` frames then read by the listener are ACKs queued during the preview, not the end of the call |
+| 16:38:40.35 | last video packet from the panel: its call with the monitor ends |
+| 16:38:40.5 | `0x1860/0x0003` sub `0x000E` (door opened / call FSM); retransmitted 4 more times over 7.4 s (the listener does not ACK it) |
+
+The frame bytes: `60 18 | ts | 00 03 | 00 0E | 00 00 | FF FF FF FF | SB000001 | SB0000011`.
+So speak treats the panel as busy from a ring until the **first**
+`0x1860/0x0003` with flags `0x000E` after it, plus 3 s, or 90 s after the ring
+when no such frame is seen; never while a session is active. Other flags are
+only logged: what the panel sends to HA when the monitor *answers* a ring is
+not known yet. If the panel still refuses the call, speak retries once 3 s
+later (the frame is retransmitted for ~7.4 s, unacknowledged).
+
+**Answer mode.** Instead of a new outbound call, speak can answer the incoming
+call HA holds after a ring (the on-ring preview, or an auto-answered call):
+- a preview is accepted with the same frames as the inbound answer (PCAP2,
+  steps 13-18): PEER (inbound layout), call_accepted `0x1840/0x0002`, ACKs of
+  the device's `0x000A`/`0x000E` with the transformed timestamp, wait for the
+  device's RTPC, CTPP monitor;
+- an auto-answered call only swaps its silence/mic sender for speak's;
+- TX follows the transport of the call's media by default (`auto`), as on
+  the outbound call. A 6741W sends an answered ring's media over TCP and
+  plays only TCP audio (door test of 2026-10-26, below); the silence/mic sender of the
+  Answer button still uses UDP;
+- a `0x1840/0x0003` CALL_END on such a call ends it (no outbound
+  re-establishment); teardown is local, as for the other sessions.
+Answering makes HA the answering unit: on a 6741W the monitor stops ringing,
+and it may skip its own actions.
+
+Open points: why a 6741W plays nothing on a call opened from Home Assistant
+(outbound "self-ignition"), and whether other models play it, perhaps only
+after the next lease renewal (~30 s), as an older note on the 6701W says for
+RX audio.
+
+**Door test, 6741W, 2026-10-26:**
+- outbound "call": the panel switches on but plays no audio (TCP and UDP);
+- "answer": heard only when HA answered within tenths of a second of the face
+  recognition (0.16 s: heard; 1.3-5.8 s: not heard). The monitor seems to act
+  on the call about 1 s after recognising, even with its door action removed
+  (the FRCG event still says `activated: true`). So speak answers first and
+  builds the audio meanwhile;
+- the TAP open (`0x18C0` registration + `0x1800`/`0x1820`/`0x18C0` door
+  frames, §6) sent **during a ring** did not trip the lock, three times, while
+  the same command at idle works. The panel still answered each one with
+  `0x1860/0x0003` from `SB100001` (flags `0x000E`): that frame is no proof
+  that the relay tripped.
+
+**Door test, 6741W, 2026-10-26, later (answer first, in-call door open):**
+- "answer" over UDP (then the default of `auto` in answer mode): the panel
+  switches its speaker on, no voice. Over TCP the voice is heard, twice, also
+  with `open_door` (greeting heard, gate opened). The panel's media on these
+  calls arrive over TCP (`Media transport = TCP (RTPC2)`): `auto` now
+  follows them in answer mode too;
+- `lock.open` during a ring with the preview up: HA answers, sends
+  `0x1840/0x000D`, the gate opens within 2-3 s. The panel sends **no ACK and
+  no CALL_END** for it (§12).
+
+## 12. Door open inside a call (`0x1840/0x000D`)
+
+```
+[LE16 0x1840] [LE32 counter] [BE16 0x000D] [BE16 0x002D]
+[door address padded to 10] [LE32 output-index] [FF FF FF FF]
+[our address padded to 10] [apartment address padded to 10]
+```
+
+Single frame on the call's CTPP, call counter +`0x00010000`; the panel ACKs
+with `0x1800/0x0000` sent from the door's unit (e.g. `SB100001`), which is how
+the integration tells the door's ACK from the bridge's own (`SB000001`).
+Verified (antoiba86, app PCAPs `camera_feed_with_open_door_local` and
+`notification+opendoorwhilevideo`) inside a call the app has answered, i.e.
+an outbound view after the `0x70`; the mnestrud 6701W reference lists it as
+"door open (during active video call)". Nothing shows it during an
+*unanswered* inbound preview, and the TAP open sent during a ring was ignored
+(above). So when the call is a ring preview the integration answers it first
+(the same frames as speak's answer: PEER, `call_accepted`, ACKs, device RTPC,
+then the silence sender as after the Answer button), sends `0x000D`, waits
+at most 2 s in all for the ACK and for the panel's CALL_END `0x1840/0x0003`
+sub `0x000E` (the relay fired, app PCAP), and hangs up (local teardown:
+nothing is sent to the panel) unless speak or a viewer uses the call. If the
+ring's call already ended (end frame queued and no more video), the preview
+is closed and the idle TAP path is used. Neither the ACK nor a following
+`0x1860/0x0003` proves that the lock tripped, and their absence proves
+nothing either: a 6741W sends no ACK and no CALL_END for an in-call open, and
+its lock trips (door test of 2026-10-26). On outgoing calls (live view, snapshot,
+speak `call`) the integration does not send `0x000D`, although the app does:
+with no ACK from a 6741W it could not tell whether the usual TAP is still
+needed, so it sends only the TAP, as before (one door command per request).
+
 ## Firmware differences (why no heavy abstraction layer)
 
 The core protocol (framing, channels, auth, config, door open, VIP signalling,
