@@ -301,7 +301,8 @@ RX audio.
   with `open_door` (greeting heard, gate opened). The panel's media on these
   calls arrive over TCP (`Media transport = TCP (RTPC2)`): `auto` now
   follows them in answer mode too;
-- `lock.open` during a ring with the preview up: HA answers, sends
+- `lock.open` during a ring with the preview up (in-call open on; today the
+  option **Open doors inside the ring's call**): HA answers, sends
   `0x1840/0x000D`, the gate opens within 2-3 s. The panel sends **no ACK and
   no CALL_END** for it (§12).
 
@@ -321,7 +322,9 @@ Verified (antoiba86, app PCAPs `camera_feed_with_open_door_local` and
 an outbound view after the `0x70`; the mnestrud 6701W reference lists it as
 "door open (during active video call)". Nothing shows it during an
 *unanswered* inbound preview, and the TAP open sent during a ring was ignored
-(above). So when the call is a ring preview the integration answers it first
+(above). `lock.open` uses it only with the option **Open doors inside the
+ring's call** (off by default; speak's `open_door` in `answer` mode always
+does). Then, when the call is a ring preview, the integration answers it first
 (the same frames as speak's answer: PEER, `call_accepted`, ACKs, device RTPC,
 then the silence sender as after the Answer button), sends `0x000D`, waits
 at most 2 s in all for the ACK and for the panel's CALL_END `0x1840/0x0003`

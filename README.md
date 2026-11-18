@@ -38,8 +38,8 @@ for ring notifications).
 - 🗣️ **Speak at the entrance (experimental)**: the `comelit_intercom.speak`
   action says a message (any Home Assistant TTS engine) or plays an audio file
   on the entrance panel's speaker, answering the ring (e.g. to greet a face the
-  monitor recognised) or in a short call of its own, and can open the door in
-  the same call.
+  monitor recognised) or in a short call of its own, and can open the door
+  afterwards.
 - 🔑 **Dedicated identity** — use a Home Assistant user paired via the app so it
   doesn't clash with your phone or the wall monitor (needed for local events).
 - 📈 **Sensors** — connectivity, ringing, last ring, ring count, events source.
@@ -132,6 +132,15 @@ use these events to open doors or disarm alarms. Don't read `activated` as "the
 door was opened" either: on a 6741W it stays `true` even when no action is
 configured for the face on the monitor.
 
+**Opening a door while it rings (opt-in).** A 6741W ignores the usual open
+command while the panel rings. With **Open doors inside the ring's call** on,
+when Home Assistant holds the ring's call (the on-ring snapshot call, or a call
+answered by speak or auto-answer), a door's `lock.open` sends the open inside
+that call, as the app does; a ring that is only being previewed is answered
+first, so the monitor stops ringing. In every other case (no call, live view,
+snapshot, speak `call`), and with the option off, the usual open command is
+sent, as before.
+
 ## How doorbell events work
 
 On current firmware the wall monitor receives calls over the native ViP bus,
@@ -200,8 +209,9 @@ played in one of two modes:
   live view, and gives up with a log line rather than cut in. If the panel
   refuses the call, it tries once more 3 s later.
 
-In both modes a ring arriving while it speaks ends the message at once, and
-speak needs the doorbell events option (that is how it sees rings).
+In both modes a ring arriving while it speaks ends the message at once. Speak
+sees rings through the integration's ring events (**Doorbell ring
+notifications**, on by default).
 
 **Tested on a 6741W** (firmware 2.1.0): `answer` is heard, over TCP; on a call
 opened by Home Assistant (`call`) the panel lights up but plays nothing, over
@@ -211,9 +221,11 @@ TCP or UDP. Other models may differ: test at the door first (see
 - **Open the door (`open_door: true`, off by default).** After the message (or
   right after answering, with no message) the door is opened: in `answer`
   mode inside the same call (the app's in-call command), in `call` mode with
-  the usual open command. A new ring during the message cuts it and opens at
-  once. `door` picks the door by name (default: the only door of that
-  entrance). Without `open_door` speak never opens anything.
+  the usual open command. In `answer` mode a new ring during the message cuts
+  it and opens at once; in `call` mode the door then stays shut. `door` picks
+  the door by name (default: the only door of that entrance). Without
+  `open_door` speak never opens anything. This works without the option
+  below: `open_door` is the explicit request.
 - **Faster audio.** Built frames of the last 32 messages stay in memory, so a
   repeated greeting starts at once. `prepare_only: true` builds and caches a
   message without any call, e.g. from an automation at startup with the same
@@ -237,14 +249,6 @@ TCP or UDP. Other models may differ: test at the door first (see
   long to wait for the panel's audio before playing anyway), `lead_in`,
   `transport` (`auto`: the transport the call's media arrive on, TCP or UDP,
   in both modes; a 6741W plays audio only over TCP).
-
-**Opening a door during a ring.** On a 6741W the usual open command sent while
-the panel rings is ignored. When Home Assistant holds the ring's call (the
-on-ring snapshot call, or a call answered by speak or auto-answer), the door's
-`lock.open` now opens inside that call, as the app does; a ring that is only
-being previewed is answered first (the monitor then stops ringing). In every
-other case (no call, live view, snapshot, speak `call`) it uses the usual open
-command, as before.
 
 ```yaml
 automation:
@@ -296,6 +300,10 @@ Integration → **Configure**:
   multi-unit systems it can affect other units.
 - **Face recognition events**: relay the monitor's face-recognition results as
   `comelit_intercom_face` events (models that advertise it). Off by default.
+- **Open doors inside the ring's call**: while Home Assistant holds a ring's
+  call, `lock.open` opens inside it, answering the preview first (the monitor
+  stops ringing). Needed on a 6741W, which ignores the usual open command while
+  it rings. Off by default.
 - **Verbose debug logging** — log protocol/video/audio internals for bug reports.
 - **Push identity token** — advanced: enroll cloud push under a different token.
 

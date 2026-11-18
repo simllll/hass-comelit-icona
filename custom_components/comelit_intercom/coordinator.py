@@ -33,6 +33,7 @@ from .const import (
     CONF_AUTO_ANSWER,
     CONF_FACE_RECOGNITION,
     CONF_HOST,
+    CONF_OPEN_DOOR_IN_CALL,
     CONF_PORT,
     CONF_TOKEN,
     DEFAULT_PORT,
@@ -785,7 +786,7 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Pause the listener unless a call already did, and hand it back
             # only when no call holds CTPP (one being set up counts): a resume
             # while a call (e.g. the ring preview) holds CTPP would let the
-            # listener steal that call's frames (seen on 26/10). A listener
+            # listener steal that call's frames (seen on a 6741W). A listener
             # left paused with no call at all is put back to listen, as before.
             if events is not None and not events.paused_for_video:
                 with contextlib.suppress(Exception):
@@ -816,13 +817,17 @@ class ComelitDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not door:
             raise Exception(f"Door '{door_name}' not found")
 
-        # A ring's call HA holds with this door's entrance (the preview, or a
-        # call answered by speak or auto-answer): open inside it with
-        # 0x1840/0x000D; on 26/10 the panel ignored the TAP sent during a
-        # ring. Any other case, outgoing calls included (live view, snapshot,
-        # speak "call"): the usual TAP below, as before 26/10. One door
-        # command per request, never both.
-        if self._shared_client and self._shared_client.connected:
+        # Option "open door inside the ring's call" (off by default): when HA
+        # holds a ring's call with this door's entrance (the preview, or a
+        # call answered by speak or auto-answer), open inside it with
+        # 0x1840/0x000D; a 6741W ignores the TAP sent during a ring. Any other
+        # case, outgoing calls included (live view, snapshot, speak "call"):
+        # the usual TAP below, as in 1.13.x. One door command per request.
+        if (
+            self.entry.options.get(CONF_OPEN_DOOR_IN_CALL, False)
+            and self._shared_client
+            and self._shared_client.connected
+        ):
             try:
                 res = await self.stream.async_open_door_in_call(door)
             except Exception as err:  # noqa: BLE001

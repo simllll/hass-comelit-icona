@@ -91,9 +91,9 @@ _DOOR_AFTER_ANSWER = 0.5
 # After the door command, wait at most this long in all for the panel's ACK
 # and its CALL_END sub 0x000E (the relay fired: app PCAP, 6701W), then go on
 # and hang up a call answered only for this. A panel that replies does so at
-# once and resends an unacknowledged frame after 0.45-1 s (logs of 23/10 and
-# 26/10), so 2 s still catch a first resent copy. The 6741W sends neither
-# after an in-call open and its lock trips anyway (door test 26/10: gate open
+# once and resends an unacknowledged frame after 0.45-1 s (6741W logs), so
+# 2 s still catch a first resent copy. The 6741W sends neither after an
+# in-call open and its lock trips anyway (6741W door test: gate open
 # within 2-3 s): there the wait is idle, and the former 6 s (2 s ACK + 4 s
 # confirmation) only delayed the hang-up. The hang-up is local (no frame is
 # sent to the panel), so it cannot cut the relay.
@@ -620,7 +620,7 @@ class ComelitStreamManager:
 
         None: HA holds no ring's call with that entrance (no call, another
         entrance, or an outgoing call: live view, snapshot, speak "call").
-        The caller then sends the usual TAP, as before 26/10: one door
+        The caller then sends the usual TAP, as in 1.13.x: one door
         command per request, never both. Otherwise a dict: sent, ack,
         confirmed (CALL_END 0x000E), inbound, answered (HA answered the ring
         preview to open), ended (the ring's call was already over: the
@@ -628,7 +628,7 @@ class ComelitStreamManager:
         reason. ACK and confirmation are awaited for at most _DOOR_WAIT in
         all; the 6741W sends neither.
 
-        Only rings' calls: there the panel ignored the TAP (26/10). A preview
+        Only rings' calls: there a 6741W ignored the TAP. A preview
         is answered first, with the same frames as speak's answer, since
         0x1840/0x000D is verified only inside a call HA has answered. In
         outgoing calls the app uses it too (PCAP, 6701W), but the 6741W never
@@ -892,7 +892,7 @@ class ComelitStreamManager:
         door_addr = str(door.get("apt-address") or "")
         # On a ring's call a new ring during the message (often the same
         # visitor pressing again) no longer prevents the open: the message
-        # was cut and the door opens at once inside this call, still ours (E4).
+        # was cut and the door opens at once inside this call, still ours.
         new_ring = self._last_ring_at > run.started_at
         if session is None or self._session is not session or not session.active:
             result["door_reason"] = "the call dropped: door not opened"
@@ -902,7 +902,7 @@ class ComelitStreamManager:
             # An outgoing speak call ("call" mode): the usual TAP, sent during
             # the call through the coordinator, as lock.open does with any
             # outgoing call; 0x1840/0x000D only on rings' calls. Not while a
-            # new ring is up: on 26/10 the panel ignored the TAP during a ring.
+            # new ring is up: a 6741W ignored the TAP during a ring.
             if new_ring:
                 result["door_reason"] = "a new ring arrived: door not opened (outgoing call)"
             else:

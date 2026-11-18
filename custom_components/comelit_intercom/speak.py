@@ -408,10 +408,9 @@ def _match_language(
     same = same or [s for s in supported if norm(s).split("-")[0] == base]
     if same:
         return same[0]
-    if warn:
-        _LOGGER.warning(
-            "Speak: %s does not list language %s; using its default", engine, language
-        )
+    (_LOGGER.warning if warn else _LOGGER.debug)(
+        "Speak: %s does not list language %s; using its default", engine, language
+    )
     return None
 
 

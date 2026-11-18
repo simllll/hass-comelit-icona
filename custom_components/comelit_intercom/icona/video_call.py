@@ -63,14 +63,14 @@ _TALK_MAX_LAG = 0.2
 # Consecutive send failures (~0.5 s) after which the talk sender gives up.
 _TALK_MAX_ERRORS = 25
 # In-call door open (0x1840/0x000D): how long to wait for the panel's ACK by
-# default. The 6741W sends none and opens anyway (door test 26/10); the
+# default. The 6741W sends none and opens anyway (6741W door test); the
 # stream manager passes its own budget.
 _DOOR_ACK_TIMEOUT = 2.0
 # A CALL_END 0x1840/0x0003 sub 0x000E this soon after our door command is the
 # panel ending the call because the relay fired (PCAP of the app's live view).
 _DOOR_CONFIRM_WINDOW = 5.0
 # Call-end frame queued while answering a preview: look this long at the video
-# to tell a call that is really over from a door frame alone (26/10).
+# to tell a call that is really over from a door frame alone (6741W).
 _ENDED_VIDEO_CHECK = 0.3
 
 
@@ -180,10 +180,10 @@ class VideoCallSession:
         self._door_addr = ""
         self._door_event_flags: int | None = None
         # The relay really fired: the panel ended the call with CALL_END sub
-        # 0x000E right after our 0x000D (the ACK alone proves nothing: on
-        # 26/10 a TAP that did not open got one too). App PCAP (6701W); the
+        # 0x000E right after our 0x000D (the ACK alone proves nothing: on a
+        # 6741W a TAP that did not open got one too). App PCAP (6701W); the
         # 6741W sends neither the ACK nor this CALL_END after an in-call open,
-        # and its lock trips anyway (door test 26/10).
+        # and its lock trips anyway (6741W door test).
         self.door_confirmed = False
         self._door_sent_at = 0.0
 
@@ -1126,7 +1126,7 @@ class VideoCallSession:
             # Mirror the device, on outbound and answered incoming calls
             # alike: send the way its media reach us (TCP when none seen yet).
             # A 6741W sends an answered ring's media over TCP and plays only
-            # TCP audio (door test 26/10: over UDP the speaker opened, silent).
+            # TCP audio (6741W door test: over UDP the speaker opened, silent).
             transport = self._media_transport or "tcp"
         self._talk_transport = transport
         self._talk_task = asyncio.create_task(self._talk_send_loop(client, transport))
@@ -1554,7 +1554,7 @@ class VideoCallSession:
         self._talk = True
         # "auto" mirrors the call's media, as on outbound talk calls: on a
         # 6741W an answered ring's media arrive over TCP and only TCP audio
-        # is played (door test 26/10; over UDP the speaker opened, silent).
+        # is played (6741W door test; over UDP the speaker opened, silent).
         self._talk_transport_pref = transport
         if not await self.accept_inbound():
             return False
@@ -1616,10 +1616,10 @@ class VideoCallSession:
             None,
         )
         if end_flags is not None:
-            # A door frame alone is no proof: on 26/10 the panel sent one after
-            # each (failed) TAP open while the ring went on. The call is over
-            # only if the panel also stopped streaming to the preview (on 23/10
-            # the video stopped 150 ms before the call-end frame).
+            # A door frame alone is no proof: a 6741W sent one after each
+            # (failed) TAP open while the ring went on. The call is over only
+            # if the panel also stopped streaming to the preview (in a 6741W
+            # log the video stopped 150 ms before the call-end frame).
             rx = self._rtp_receiver
             seen = (rx.tcp_media_packet_count + rx.udp_media_packet_count) if rx else 0
             await asyncio.sleep(_ENDED_VIDEO_CHECK)
@@ -1779,11 +1779,11 @@ class VideoCallSession:
         Sends 0x1840/0x000D (async_open_door_on_ctpp) and waits for the 0x1800
         ACK sent by the door's unit (the panel ACKs from its own address,
         e.g. SB100001). Returns (acked, flags of a 0x1860/0x0003 door frame
-        seen meanwhile, or None). Neither proves that the relay tripped: on
-        26/10 the panel answered a TAP open during a ring with 0x1860/0x0003
-        and the lock stayed shut. Nor does their absence prove the opposite:
-        the 6741W sends no ACK (and no CALL_END) for an in-call open, and
-        its lock trips (door test 26/10).
+        seen meanwhile, or None). Neither proves that the relay tripped: a
+        6741W answered a TAP open during a ring with 0x1860/0x0003 and the
+        lock stayed shut. Nor does their absence prove the opposite: the
+        6741W sends no ACK (and no CALL_END) for an in-call open, and its
+        lock trips (6741W door test).
         """
         async with self._door_lock:
             loop = asyncio.get_running_loop()

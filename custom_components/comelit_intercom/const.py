@@ -56,6 +56,11 @@ CONF_AUTO_ANSWER = "auto_answer"
 # Opt-in: relay the monitor's face-recognition notifications (FRCG channel)
 # as comelit_intercom_face bus events. Off by default.
 CONF_FACE_RECOGNITION = "face_recognition"
+# Opt-in: lock.open while HA holds a ring's call (the on-ring preview, or a
+# call answered by speak or auto-answer) opens the door inside that call with
+# 0x1840/0x000D, answering the preview first. Off by default: the usual TAP,
+# as in 1.13.x. A 6741W needs it: it ignores the TAP while it rings.
+CONF_OPEN_DOOR_IN_CALL = "open_door_in_call"
 
 FCM_PROJECT_ID = "friend-home-55eb5"
 FCM_APP_ID = "1:140273510303:android:ecb227a626746c69"

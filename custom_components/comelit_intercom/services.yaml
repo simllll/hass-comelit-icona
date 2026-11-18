@@ -98,7 +98,8 @@ speak:
     logs why. Mode "answer" answers the incoming call Home Assistant holds
     after a ring at once and speaks on it as soon as the audio is ready (the
     monitor may then lose that call). With "Open the door" it opens the door
-    inside the same call afterwards; it never opens otherwise. "Prepare only"
+    afterwards: inside the answered ring's call in mode "answer", with the
+    usual open command in mode "call"; it never opens otherwise. "Prepare only"
     builds and caches the audio without any call. Experimental. Returns the
     outcome (spoken, door, reason, timings).
   target:
