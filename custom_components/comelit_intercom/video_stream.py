@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant
 
+from .const import CONF_FACE_RECOGNITION
 from .icona.client import IconaBridgeClient as SharedIconaClient
 from .icona.models import DeviceConfig
 from .icona.rtsp_server import LocalRtspServer
@@ -52,6 +53,10 @@ _CONNECT_GRACE = 12.0
 _STALL_TIMEOUT = 10.0
 # How long to wait for a freshly-decoded frame for a still.
 _SNAPSHOT_TIMEOUT = 8.0
+# With face-recognition events on, hold the on-ring preview until this long
+# after the ring: the monitor recognises a face 4-10 s after the ring, and
+# speak(mode=answer) can only answer the call while the preview is held.
+_FACE_PREVIEW_HOLD = 16.0
 
 # --- speak (talk-back) -------------------------------------------------
 # After a ring the panel is busy (calling the monitor) until the door-open
@@ -219,6 +224,9 @@ class ComelitStreamManager:
                 _LOGGER.warning("Snapshot decode failed: %s", err)
                 jpeg = None
             if jpeg is None:
+                if self._speak_owns_session():
+                    # Never drop the call speak is using: it hangs up by itself.
+                    return None
                 # No fresh frame → the call likely died; drop it so the next
                 # request starts a clean one instead of returning a frozen frame.
                 _LOGGER.debug("Snapshot: no fresh frame, recycling call")
@@ -428,6 +436,8 @@ class ComelitStreamManager:
         """
         loop = self.hass.loop
         deadline = loop.time() + grace
+        if self._coordinator.entry.options.get(CONF_FACE_RECOGNITION, False):
+            deadline = max(deadline, ring_at + _FACE_PREVIEW_HOLD)
         while loop.time() < deadline:
             server = self._server
             if (server is not None and server.client_count > 0) or (
