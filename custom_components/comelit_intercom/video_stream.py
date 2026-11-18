@@ -47,6 +47,13 @@ _CONNECT_GRACE = 12.0
 _STALL_TIMEOUT = 10.0
 # How long to wait for a freshly-decoded frame for a still.
 _SNAPSHOT_TIMEOUT = 8.0
+# The on-ring preview's first decoded frame can be black while the panel
+# camera settles (seen on a 6741W: 1.8 KB at 320x240, a real frame is 15-20 KB).
+# A ring still smaller than this is replaced by a later frame...
+_RING_SNAPSHOT_MIN_BYTES = 4000
+# ...for at most this long after the first one; if none reaches the size, the
+# largest frame seen is used.
+_RING_SNAPSHOT_SETTLE = 2.0
 
 
 class ComelitStreamManager:
@@ -302,19 +309,45 @@ class ComelitStreamManager:
 
         Used by the on-ring snapshot: after `async_start_inbound` has the
         preview video flowing, pull a frame without opening a second call.
+        A near-empty (black) first frame is replaced by a later one for up to
+        _RING_SNAPSHOT_SETTLE seconds; the largest frame seen wins.
         """
         rx = self._session.rtp_receiver if self._session else None
         if rx is None:
             return None
+        best: bytes | None = None
+        deadline: float | None = None
+        first_size = frames = 0
         try:
             jpeg = await rx.get_jpeg_frame(timeout=_SNAPSHOT_TIMEOUT)
+            while jpeg:
+                frames += 1
+                if best is None or len(jpeg) > len(best):
+                    best = jpeg
+                if len(jpeg) >= _RING_SNAPSHOT_MIN_BYTES:
+                    break
+                if deadline is None:
+                    deadline = self.hass.loop.time() + _RING_SNAPSHOT_SETTLE
+                    first_size = len(jpeg)
+                remaining = deadline - self.hass.loop.time()
+                if remaining <= 0:
+                    break
+                jpeg = await rx.get_jpeg_frame(timeout=remaining)
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("On-ring snapshot decode failed: %s", err)
-            return None
-        if jpeg:
+        if deadline is not None:
+            _LOGGER.debug(
+                "On-ring snapshot: first frame %d bytes looked black, kept %d bytes "
+                "after %d frames (%.1f s)",
+                first_size,
+                len(best) if best else 0,
+                frames,
+                _RING_SNAPSHOT_SETTLE - max(0.0, deadline - self.hass.loop.time()),
+            )
+        if best:
             self._touch()
-            _LOGGER.debug("On-ring snapshot: %d byte JPEG", len(jpeg))
-        return jpeg
+            _LOGGER.debug("On-ring snapshot: %d byte JPEG", len(best))
+        return best
 
     async def async_release_after_snapshot(
         self, ring_at: float, grace: float = 6.0
